@@ -5,7 +5,7 @@
 <!ENTITY version   "2026.10.17">
 <!ENTITY launch    "Utilities/playback-cache">
 <!ENTITY plgdir    "/boot/config/plugins/&name;">
-<!ENTITY pkg       "&name;-&version;-x86_64-1.txz">
+<!ENTITY pkg       "&name;-&version;-x86_64-2.txz">
 <!ENTITY gdbpkg    "gdb-15.2-x86_64-3.txz">
 <!ENTITY py3pkg    "python3-3.12.8-x86_64-1.txz">
 <!ENTITY support   "https://github.com/adolfotregosa/Playback-Cache">

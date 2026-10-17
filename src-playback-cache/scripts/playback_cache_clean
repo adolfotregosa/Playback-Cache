@@ -105,6 +105,9 @@ chmod 644 "$exclusion_list" 2> /dev/null
 ### lock, a lost line would leave a cached folder untracked and unprotected from the mover
 list_lock="/var/run/playback-cache-list.lock"
 stamps_file="${exclusion_list}.stamps"
+### the copy job notes size and time of every file it copied, a pool file that still
+### matches its note is an untouched copy and can go without looking at the array
+copies_file="${exclusion_list}.copies"
 with_list_lock() { # runs the command with the list lock held, fd 8, the run lock owns 9
 	(
 		flock 8
@@ -122,11 +125,18 @@ stamp_folder() { # $1 folder, (re)starts its keep timer
 }
 unstamp_folder() { # $1 folder, forgets its keep timer
 	[ -z "$exclusion_list" ] && return 0
-	[ -f "$stamps_file" ] || return 0
 	local stamp_tmp
 	stamp_tmp=$(mktemp) 2> /dev/null || return 1
-	awk -F '\t' -v f="$1" '$2 != f' "$stamps_file" > "$stamp_tmp" 2> /dev/null && mv "$stamp_tmp" "$stamps_file" 2> /dev/null
+	if [ -f "$stamps_file" ]; then
+		awk -F '\t' -v f="$1" '$2 != f' "$stamps_file" > "$stamp_tmp" 2> /dev/null && mv "$stamp_tmp" "$stamps_file" 2> /dev/null
+	fi
 	rm -f "$stamp_tmp" 2> /dev/null
+	### a folder that leaves the list takes its copy notes along
+	if [ -f "$copies_file" ]; then
+		stamp_tmp=$(mktemp) 2> /dev/null || return 1
+		awk -F '\t' -v p="$1/" 'index($1, p) != 1' "$copies_file" > "$stamp_tmp" 2> /dev/null && mv "$stamp_tmp" "$copies_file" 2> /dev/null
+		rm -f "$stamp_tmp" 2> /dev/null
+	fi
 }
 
 ### list settings are comma seperated, spaces inside a value are allowed
@@ -293,38 +303,73 @@ for folder in "${pc_folders[@]}"
 		### path text only from here on, deciding from the stamps alone must not touch any disk
 		relpath=$(echo "${folder/"/mnt/$cache_pool"/}")
 		if [ $pc_release_now -eq 1 ] || { [ -n "$keephours" ] && [ -n "$last_access" ] && [ "$last_access" -gt "$keephours" ]; }; then
-			### only a folder that is due touches the array, everything else is decided from the stamps alone
-			find_targetdir
 			### per file, not all or nothing: new files can land in a cached folder (the pool is the share
-			### primary), they must not pin the folder on the list forever, drop the verified duplicates,
-			### keep everything else and release the folder, the mover handles what stays
-			if [ -z "$targetdir" ] || [ ! -d "$targetdir" ]; then
-				echo "$folder untouched for $last_access hours but its original folder is not found anymore, removed from the list, mover may move the cache copy back"
-				if [ "$notifications" = "yes" ]; then
-					/usr/local/emhttp/webGui/scripts/notify -e "Playback Cache Info" -s "Check Note" -d "$folder/" -i "warning" &
-				fi
-			else
+			### primary), they must not pin the folder on the list forever, drop the copies, keep
+			### everything else and release the folder, the mover handles what stays
+			pc_tidy=1
+			pc_notes=""
+			[ -f "$copies_file" ] && pc_notes=$(awk -F '\t' -v p="$folder/" 'index($1, p) == 1' "$copies_file" 2> /dev/null)
+			if [ -n "$pc_notes" ]; then
+				### decided from the pool and the copy notes alone, no array disk is touched
+				unset pc_note
+				declare -A pc_note=()
+				while IFS=$'\t' read -r pc_nf pc_nv
+					do
+					[ -n "$pc_nf" ] && pc_note["$pc_nf"]="$pc_nv"
+					done <<< "$pc_notes"
 				pc_rm_n=0
 				pc_stale=""
 				while IFS= read -r -d '' cache_file
 					do
-					array_file="$targetdir/${cache_file#"$folder"/}"
-					if [ ! -f "$array_file" ]; then
-						### only on the pool, a newer download, the mover picks it up once the folder is released
-						echo "keeping $cache_file, not on the array yet, the mover handles it"
-					elif [ "$(stat --printf "%s %Y" "$cache_file" 2> /dev/null)" == "$(stat --printf "%s %Y" "$array_file" 2> /dev/null)" ]; then
-						### identical twin, size and time, rsync -a keeps both, no recycle here:
-						### the array holds the same file, a pool copy of it is only wasted space
+					if [ -z "${pc_note["$cache_file"]+x}" ]; then
+						### never copied by this plugin, a newer download or a subtitle, the mover picks it up
+						echo "keeping $cache_file, not copied by this plugin, the mover handles it"
+					elif [ "$(stat --printf "%s %Y" "$cache_file" 2> /dev/null)" == "${pc_note["$cache_file"]}" ]; then
+						### still exactly what rsync wrote, the array holds the same file
 						if rm -f -- "$cache_file" 2> /dev/null; then
 							pc_rm_n=$((pc_rm_n+1))
 						fi
 					else
-						### same name, different file, an upgrade written through the pool, mover skips files
-						### that already exist on the array so this pair needs eyes on it
+						### same name, changed on the pool after the copy, an upgrade written through
+						### the pool, mover skips files that already exist on the array, needs eyes on it
 						pc_stale="$cache_file"
-						echo "WARN: keeping $cache_file, a different version exists on the array, mover skips files that exist there, check this pair"
+						echo "WARN: keeping $cache_file, it changed on the pool after the copy, mover skips files that exist on the array, check this pair"
 					fi
 					done < <(find "$folder/" -type f -print0 2> /dev/null)
+			else
+				### cached before the copy notes existed, verify against the array once, as before
+				find_targetdir
+				if [ -z "$targetdir" ] || [ ! -d "$targetdir" ]; then
+					echo "$folder untouched for $last_access hours but its original folder is not found anymore, removed from the list, mover may move the cache copy back"
+					if [ "$notifications" = "yes" ]; then
+						/usr/local/emhttp/webGui/scripts/notify -e "Playback Cache Info" -s "Check Note" -d "$folder/" -i "warning" &
+					fi
+					pc_tidy=0
+				else
+					pc_rm_n=0
+					pc_stale=""
+					while IFS= read -r -d '' cache_file
+						do
+						array_file="$targetdir/${cache_file#"$folder"/}"
+						if [ ! -f "$array_file" ]; then
+							### only on the pool, a newer download, the mover picks it up once the folder is released
+							echo "keeping $cache_file, not on the array yet, the mover handles it"
+						elif [ "$(stat --printf "%s %Y" "$cache_file" 2> /dev/null)" == "$(stat --printf "%s %Y" "$array_file" 2> /dev/null)" ]; then
+							### identical twin, size and time, rsync -a keeps both, no recycle here:
+							### the array holds the same file, a pool copy of it is only wasted space
+							if rm -f -- "$cache_file" 2> /dev/null; then
+								pc_rm_n=$((pc_rm_n+1))
+							fi
+						else
+							### same name, different file, an upgrade written through the pool, mover skips files
+							### that already exist on the array so this pair needs eyes on it
+							pc_stale="$cache_file"
+							echo "WARN: keeping $cache_file, a different version exists on the array, mover skips files that exist there, check this pair"
+						fi
+						done < <(find "$folder/" -type f -print0 2> /dev/null)
+				fi
+			fi
+			if [ $pc_tidy -eq 1 ]; then
 				if [ $pc_rm_n -gt 0 ]; then
 					echo "removed $pc_rm_n verified copies from $folder"
 					if [ "$notifications" = "yes" ]; then

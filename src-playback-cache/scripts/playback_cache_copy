@@ -153,6 +153,9 @@ chmod 644 "$exclusion_list" 2> /dev/null
 ### lock, a lost line would leave a cached folder untracked and unprotected from the mover
 list_lock="/var/run/playback-cache-list.lock"
 stamps_file="${exclusion_list}.stamps"
+### what each copy looked like right after rsync, the cleaner compares the pool with these
+### notes instead of the array, so a release never has to wake a disk
+copies_file="${exclusion_list}.copies"
 with_list_lock() { # runs the command with the list lock held, fd 8, the run lock owns 9
 	(
 		flock 8
@@ -175,6 +178,28 @@ unstamp_folder() { # $1 folder, forgets its keep timer
 	stamp_tmp=$(mktemp) 2> /dev/null || return 1
 	awk -F '\t' -v f="$1" '$2 != f' "$stamps_file" > "$stamp_tmp" 2> /dev/null && mv "$stamp_tmp" "$stamps_file" 2> /dev/null
 	rm -f "$stamp_tmp" 2> /dev/null
+}
+note_copies() { # $1 array source, $2 its pool target, after a good rsync, called under the lock
+	local src="${1%/}" dst="${2%/}" rel tmp
+	[ -z "$exclusion_list" ] && return 0
+	tmp=$(mktemp) 2> /dev/null || return 1
+	if [ -d "$src" ]; then
+		### folder copy, every file that came from the array, never a file that was only on the pool
+		while IFS= read -r -d '' rel
+			do
+			[ -f "$dst/$rel" ] && printf '%s\t%s\n' "$dst/$rel" "$(stat --printf '%s %Y' "$dst/$rel" 2> /dev/null)"
+			done < <(find "$src" -type f -printf '%P\0' 2> /dev/null)
+	else
+		[ -f "$dst" ] && printf '%s\t%s\n' "$dst" "$(stat --printf '%s %Y' "$dst" 2> /dev/null)"
+	fi > "$tmp.new"
+	if [ -s "$tmp.new" ]; then
+		touch "$copies_file" 2> /dev/null
+		### a note per file, a new copy of the same file replaces its old note
+		awk -F '\t' 'NR == FNR { n[$1] = 1; next } !($1 in n)' "$tmp.new" "$copies_file" > "$tmp" 2> /dev/null
+		cat "$tmp.new" >> "$tmp"
+		mv "$tmp" "$copies_file" 2> /dev/null
+	fi
+	rm -f "$tmp" "$tmp.new" 2> /dev/null
 }
 add_to_list() { # $1 folder, list line plus fresh stamp, called under the lock
 	printf '%s\n' "$1" >> "$exclusion_list" 2> /dev/null
@@ -324,6 +349,7 @@ ask_playing() { # prints "type<TAB>server path" for every playing item, 2 means 
 resolve_item() { # $1 server path, sets openpath/diskpath/poolpath/rsync_*/srcmnt, rc 1 means skip this item
 	local relpath src_dir dev
 	### the server reports the path inside its own mount, turn it into the host path
+	pc_pool_hit=0
 	openpath=$(apply_rewrite "$1")
 	echo "playing: $item_type $openpath"
 	### the host path is the array path or the pool path of the same file
@@ -341,6 +367,16 @@ resolve_item() { # $1 server path, sets openpath/diskpath/poolpath/rsync_*/srcmn
 	if [ -z "$relpath" ]; then
 		echo "ERROR: the server path $1 is not under /mnt on the host, add a mapping"
 		return 1
+	fi
+	### pool first: a file that already plays from the pool never needs the array, so
+	### the array is not even looked at, every lookup there can wake a sleeping disk
+	if [ -f "/mnt/$cache_pool/$relpath" ]; then
+		pc_pool_hit=1
+		diskpath=""
+		poolpath="/mnt/$cache_pool/$relpath"
+		rsync_source=""
+		rsync_target=$(dirname "$poolpath")
+		return 0
 	fi
 	### the exact path on the array, no globbing, an Extended cut must never win over the playing file
 	diskpath=""
@@ -545,6 +581,18 @@ cache_the_item() {
 			return 1
 		fi
 	fi
+	### already on the pool: decided without touching the array, a listed folder gets its
+	### keep timer restarted, anything else is new media waiting for the mover
+	if [ "$pc_pool_hit" == "1" ]; then
+		if grep -Fxq -- "$rsync_target" "$exclusion_list" 2> /dev/null; then
+			echo "already on the cache: $rsync_target"
+			with_list_lock stamp_folder "$rsync_target"
+			PC_RESULT="already on the cache: $(basename "$rsync_target")"
+		else
+			echo "$openpath plays from the pool, not cached by this plugin, left to the mover"
+		fi
+		return 0
+	fi
 	### pool only media, nothing to copy, restart the keep timer of the folder
 	if [ -z "$diskpath" ]; then
 		echo "$openpath is not on the array, nothing to copy"
@@ -580,6 +628,7 @@ cache_the_item() {
 		if ! pc_rsync "${copy_sources[$index]}" "${copy_targets[$index]}"; then
 			return 1
 		fi
+		with_list_lock note_copies "${copy_sources[$index]}" "${copy_targets[$index]}"
 		pc_done=$((pc_done+1))
 		done
 	if [ "$notifications" = "yes" ] && [ "$pc_was_cached" == "0" ]; then
