@@ -37,7 +37,7 @@ pc_syslog="no"
 [ "$log_to_syslog" == "yes" ] && pc_syslog="yes"
 exec > >(while IFS= read -r pc_line; do
 	case "$pc_line" in
-		"caching "*|*"switched to cache:"*|*"already on the cache"*|*"changed under us:"*|gdb\ *|"rsync failed:"*|ERROR:*|WARN:*|"cancel requested,"*|"no usable answer"*)	pc_event=1 ;;
+		"caching "*|*"switched to cache:"*|*"changed under us:"*|gdb\ *|"rsync failed:"*|ERROR:*|WARN:*|"cancel requested,"*|"no usable answer"*)	pc_event=1 ;;
 		*)	pc_event=0 ;;
 	esac
 	if [ $pc_now -eq 0 ] && [ $pc_event -eq 0 ]; then continue; fi
