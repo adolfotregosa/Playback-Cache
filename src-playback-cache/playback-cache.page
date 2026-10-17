@@ -1,0 +1,481 @@
+Menu="Utilities"
+Type="xmenu"
+Title="Playback Cache"
+Icon="playback-cache.png"
+Tag="icon-disk"
+Tabs="true"
+---
+<?php
+$pcsettings            = @parse_ini_file("/boot/config/plugins/playback-cache/playback-cache.cfg",true);
+// playback cache
+$pcsettings_media_folders        = isset($pcsettings['media_folders']) ? $pcsettings['media_folders'] : "";
+$pcsettings_never_cache        = isset($pcsettings['never_cache']) ? $pcsettings['never_cache'] : "";
+$pcsettings_cache_pool        = isset($pcsettings['cache_pool']) ? $pcsettings['cache_pool'] : "";
+$pcsettings_wait_minutes        = isset($pcsettings['wait_minutes']) ? $pcsettings['wait_minutes'] : "";
+// old installs stored seconds, this field counts minutes now, one old big value becomes minutes on first view
+if ($pcsettings_wait_minutes > 59) { $pcsettings_wait_minutes = intval(round($pcsettings_wait_minutes / 60)); }
+// legacy values like "copy" or "file" all mean Files in use, only "folder" is a real choice
+$pcsettings_copy_scope        = (isset($pcsettings['copy_scope']) && $pcsettings['copy_scope'] == "folder") ? "folder" : "";
+// cache keepalive
+$pcsettings_keep_hours        = isset($pcsettings['keep_hours']) ? $pcsettings['keep_hours'] : "";
+$pcsettings_keep_hours_long        = isset($pcsettings['keep_hours_long']) ? $pcsettings['keep_hours_long'] : "";
+$pcsettings_keep_long_folders        = isset($pcsettings['keep_long_folders']) ? $pcsettings['keep_long_folders'] : "";
+// cache processing
+$pcsettings_exclusion_list        = isset($pcsettings['exclusion_list']) ? $pcsettings['exclusion_list'] : "";
+// Log
+$pcsettings_log_to_syslog        = isset($pcsettings['log_to_syslog']) ? $pcsettings['log_to_syslog'] : "";
+$pcsettings_notifications        = isset($pcsettings['notifications']) ? $pcsettings['notifications'] : "";
+// Cron
+$pcsettings_copy_cron        = isset($pcsettings['copy_cron']) ? $pcsettings['copy_cron'] : "";
+$pcsettings_clean_cron        = isset($pcsettings['clean_cron']) ? $pcsettings['clean_cron'] : "";
+// Cron rsync
+$pcsettings_rsync_command        = isset($pcsettings['rsync_command']) ? $pcsettings['rsync_command'] : "";
+// cache MediaServer
+$pcsettings_mediaserver_type        = isset($pcsettings['mediaserver_type']) ? $pcsettings['mediaserver_type'] : "";
+$pcsettings_mediaserver_host        = isset($pcsettings['mediaserver_host']) ? $pcsettings['mediaserver_host'] : "";
+$pcsettings_mediaserver_port        = isset($pcsettings['mediaserver_port']) ? $pcsettings['mediaserver_port'] : "";
+$pcsettings_mediaserver_key        = isset($pcsettings['mediaserver_key']) ? $pcsettings['mediaserver_key'] : "";
+$pcsettings_path_mappings       = isset($pcsettings['path_mappings']) ? $pcsettings['path_mappings'] : "";
+// dropdown of fixed values, a stored value that is not listed stays selectable
+function sel($name, $value, $options, $extra = "") {
+    if ($value != "" && !array_key_exists($value, $options)) { $options[$value] = $value; }
+    $html = "<select name=\"".$name."\" style=\"width:auto;\"".$extra.">";
+    foreach ($options as $option_value => $option_label) {
+        $selected = ((string)$value === (string)$option_value) ? " selected" : "";
+        $html .= "<option value=\"".htmlspecialchars($option_value)."\"".$selected.">".htmlspecialchars($option_label)."</option>";
+    }
+    return $html."</select>";
+}
+// what the crontab really holds, a stored state string can lie
+function cron_friendly($cron) {
+    $f = preg_split('/\s+/', trim($cron));
+    if (count($f) != 5) { return $cron; }
+    if ($f[1] == '*' && $f[2] == '*' && $f[3] == '*' && $f[4] == '*') {
+        if (strpos($f[0], '*/') === 0) { return "every ".(int)substr($f[0], 2)." minutes"; }
+        if (is_numeric($f[0])) { return "every hour at minute ".(int)$f[0]; }
+    }
+    if ($f[2] == '*' && $f[3] == '*' && $f[4] == '*' && is_numeric($f[0]) && is_numeric($f[1])) {
+        return "every day at ".sprintf("%02d:%02d", $f[1], $f[0]);
+    }
+    if ($f[2] == '*' && $f[3] == '*' && is_numeric($f[4]) && is_numeric($f[0]) && is_numeric($f[1])) {
+        $days = array("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday");
+        $d = (int)$f[4] == 7 ? 0 : (int)$f[4];
+        return "every ".$days[$d]." at ".sprintf("%02d:%02d", $f[1], $f[0]);
+    }
+    return $cron;
+}
+// handle switching needs gdb; the NerdTools gdb links against libpython3.12, so python3 must be installed too
+$gdb_lines = array(); $gdb_rc = 1;
+exec('PATH="$PATH:/usr/bin:/usr/local/bin:/bin" gdb --version 2>&1', $gdb_lines, $gdb_rc);
+$gdb_out = trim(implode(" ", (array)$gdb_lines));
+if ($gdb_rc === 0 && $gdb_out !== "") { $gdb_status = "ok"; }
+elseif (strpos($gdb_out, "libpython") !== false) { $gdb_status = "nopython"; }
+elseif ($gdb_out === "" || strpos($gdb_out, "not found") !== false) { $gdb_status = "missing"; }
+else { $gdb_status = "broken"; }
+// real mounted pools only: unRAID pools from emhttp, plus every /mnt/<name> mount on a real disk filesystem (ZFS included).
+// The Unassigned Devices plugin tmpfs mounts (addons, remotes, rootshare) and fuse mounts are never targets.
+$pool_options = array();
+foreach ((array)@file("/var/local/emhttp/pools.ini") ?: array() as $ini_line) {
+    if (preg_match('/^\[name="([^"]+)"/', $ini_line, $pool_match)) { $pool_options[$pool_match[1]] = $pool_match[1]; }
+}
+foreach ((array)@file("/proc/mounts") ?: array() as $mnt_line) {
+    $mnt_f = preg_split('/\s+/', trim($mnt_line));
+    if (count($mnt_f) < 3 || !preg_match('#^/mnt/([^/]+)$#', $mnt_f[1], $mnt_match)) { continue; }
+    if (preg_match('/^(disk[0-9]+|user[0-9]*|disks)$/', $mnt_match[1]) || !preg_match('/^(zfs|btrfs|xfs|ext[234]|jfs|reiserfs|f2fs|ntfs|ntfs3|exfat)$/i', $mnt_f[2])) { continue; }
+    $pool_options[$mnt_match[1]] = $mnt_match[1];
+}
+if (count($pool_options) == 0) { $pool_options["cache"] = "cache"; }
+$cron_copy        = "Inactive";
+$cron_clean        = "Inactive";
+foreach (explode("\n", (string)shell_exec("crontab -l 2> /dev/null")) as $cron_line) {
+    if (strpos($cron_line, "playback-cache/scripts/playback_cache") === false) { continue; }
+    $cron_when = trim(preg_replace('/\s*\/usr\/local\/emhttp.*$/', '', $cron_line));
+    if (strpos($cron_line, "playback_cache_copy") !== false) { $cron_copy = "Active: ".cron_friendly($cron_when); }
+    if (strpos($cron_line, "playback_cache_clean") !== false) { $cron_clean = "Active: ".cron_friendly($cron_when); }
+}
+?>
+
+<script>
+    function showKind(p) {
+        var kind = document.getElementById(p+"_kind").value;
+        var parts = document.querySelectorAll("[data-kind='"+p+"']");
+        for (var i = 0; i < parts.length; i++) {
+            parts[i].style.display = (" "+parts[i].getAttribute("data-for")+" ").indexOf(" "+kind+" ") >= 0 ? "" : "none";
+        }
+    }
+    function pad2(n) { return ("0"+n).slice(-2); }
+    function fillPort() {
+        var type = document.getElementById("mediaserver_type").value;
+        var standard = {"jelly": "8096", "emby": "8096", "plex": "32400"};
+        if (standard[type]) { document.getElementById("mediaserver_port").value = standard[type]; }
+    }
+    var pcRunning = [], pcCopying = [], pcTimer = null, pcFast = false;
+    function pcFmt(epoch) {
+        var d = new Date(epoch*1000), n = new Date();
+        var hm = pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+        return d.toDateString() == n.toDateString() ? hm : (d.getMonth()+1) + "/" + d.getDate() + " " + hm;
+    }
+    function pcPct(text) {
+        var m = text.match(/(\d+) of (\d+)/);
+        return m ? " (" + Math.floor(m[1]*100/m[2]) + "%)" : "";
+    }
+    function pcUpdate(s) {
+        var out = [], job, j, checking = false, copying = false, waiting = "";
+        pcRunning = []; pcCopying = [];
+        for (var i = 0; i < 2; i++) {
+            job = i == 0 ? "copy" : "clean";
+            j = s[job];
+            if (j.running) {
+                pcRunning.push(job);
+                // only real file work is worth a loud line, looking and waiting is not
+                if (/^(file|folder) [0-9]+ of [0-9]+$/.test(j.text)) {
+                    copying = true;
+                    pcCopying.push(job);
+                    out.push((job == "copy" ? "Copying" : "Cleaning") + " - " + j.text + pcPct(j.text));
+                }
+                else if (!waiting && /^waiting /.test(j.text)) { waiting = j.text; }
+                else { checking = true; }
+            }
+            else if (j.end) { out.push("Last " + job + ": " + pcFmt(j.since) + " - " + j.text); }
+        }
+        // the pipe keeps copy and clean apart, the dot stays for the trailing extras
+        var txt = out.length ? out.join("   |   ") : "Nothing to copy";
+        if (!copying) { if (waiting) { txt += "   ·   " + waiting; } else if (checking) { txt += "   ·   checking"; } }
+        document.getElementById("pc_status").textContent = txt;
+        // poll fast while something runs, lazy when idle
+        var wantFast = pcRunning.length > 0;
+        if (wantFast != pcFast) {
+            pcFast = wantFast;
+            if (pcTimer) { clearInterval(pcTimer); pcTimer = setInterval(pcPoll, wantFast ? 2000 : 4000); }
+        }
+        // buttons stay reachable while the script only looks around, a second start is refused politely
+        document.getElementById("pc_run_copy").style.display = pcCopying.indexOf("copy") >= 0 ? "none" : "";
+        document.getElementById("pc_run_clean").style.display = pcCopying.indexOf("clean") >= 0 ? "none" : "";
+        // the script honours a cancel during the waiting time too, so the button is
+        // reachable whenever any job runs, not only while bytes move
+        document.getElementById("pc_cancel").style.display = pcRunning.length ? "" : "none";
+    }
+    function pcPoll() {
+        if (document.hidden) { return; }
+        fetch("/plugins/playback-cache/control.php?action=status", { cache: "no-store" }).then(function(r){ return r.json(); }).then(pcUpdate).catch(function(){});
+    }
+    function pcPost(body, done) {
+        if (typeof csrf_token != "undefined") { body += "&csrf_token=" + encodeURIComponent(csrf_token); }
+        fetch("/plugins/playback-cache/control.php", { method: "POST", cache: "no-store", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: body })
+            .then(function(r){ return r.json(); }).then(done).catch(function(){ document.getElementById("pc_status").textContent = "could not reach the plugin endpoint"; });
+    }
+    function pcRun(job) {
+        pcPost("action=run&job=" + job, function(d){
+            document.getElementById("pc_status").textContent = d.msg;
+            pcPoll();
+            // the script needs a moment to write its first state, poll fast until it shows up
+            var tries = 0;
+            var burst = setInterval(function() {
+                pcPoll();
+                if (pcRunning.length || ++tries > 6) { clearInterval(burst); }
+            }, 1000);
+        });
+    }
+    function pcCancel() {
+        for (var i = 0; i < pcRunning.length; i++) { pcPost("action=cancel&job=" + pcRunning[i], function(d){}); }
+        document.getElementById("pc_status").textContent = "cancel requested, stopping after the current file";
+    }
+    function testMediaServer() {
+        var out = document.getElementById("test_result");
+        var type = document.getElementById("mediaserver_type").value;
+        var host = document.getElementById("mediaserver_host").value.trim();
+        var port = document.getElementById("mediaserver_port").value.trim();
+        var key = document.getElementById("mediaserver_key").value.trim();
+        if (type == "") { out.className = "red"; out.textContent = "Pick a server type first"; return; }
+        if (host == "" || port == "" || key == "") { out.className = "red"; out.textContent = "Fill host, port and key first"; return; }
+        out.className = ""; out.textContent = "Testing...";
+        var body = "type="+encodeURIComponent(type)+"&host="+encodeURIComponent(host)+"&port="+encodeURIComponent(port)+"&key="+encodeURIComponent(key);
+        // unRAID rejects every POST without the page token, that is what answers with {"error":...}
+        if (typeof csrf_token != "undefined") { body += "&csrf_token="+encodeURIComponent(csrf_token); }
+        fetch("/plugins/playback-cache/test_server.php", { method: "POST", cache: "no-store", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: body })
+        .then(function (r) { return r.text().then(function (txt) { return { status: r.status, txt: txt }; }); })
+        .then(function (r) {
+            var d = null;
+            try { d = JSON.parse(r.txt); } catch (e) {}
+            out.className = "red";
+            if (d && typeof d.msg == "string") {
+                out.className = d.ok ? "green" : "red";
+                out.textContent = (d.ok ? "OK: " : "") + d.msg;
+            } else if (d && typeof d.error == "string") {
+                out.textContent = d.error;
+            } else {
+                out.textContent = r.status == 200 ? "unexpected answer: " + r.txt.replace(/[\r\n\t]+/g, " ").substring(0, 90) : "the web server answered HTTP " + r.status;
+            }
+        })
+        .catch(function () { out.className = "red"; out.textContent = "the web server could not run the test"; });
+    }
+    function buildCron(p) {
+        var kind = document.getElementById(p+"_kind").value;
+        if (kind == "none") { return ""; }
+        if (kind == "min") {
+            var n = parseInt(document.getElementById(p+"_n").value);
+            if (isNaN(n) || n < 1) { n = 10; }
+            if (n > 59) { n = 59; }
+            return "*/" + n + " * * * *";
+        }
+        if (kind == "custom") { return document.getElementById(p+"_c").value; }
+        var t = document.getElementById(p+"_t").value;
+        if (!/^\d{1,2}:\d{2}$/.test(t)) { t = "00:00"; }
+        var h = parseInt(t.split(":")[0]) % 24, m = parseInt(t.split(":")[1]) % 60;
+        if (kind == "day") { return m+" "+h+" * * *"; }
+        return m+" "+h+" * * "+document.getElementById(p+"_d").value;
+    }
+    function setN(p, v) {
+        document.getElementById(p+"_n").value = v;
+    }
+    function initSchedule(p, cron) {
+        var kind = "none", f = (cron || "").trim().split(/\s+/);
+        if ((cron || "").trim() && p == "copy" && f.length == 5 && f[1] == "*" && f[2] == "*" && f[3] == "*" && f[4] == "*" && /^\*\/\d+$/.test(f[0])) {
+            setN(p, f[0].slice(2)); kind = "min";
+        } else if ((cron || "").trim() && p == "copy" && f.join(" ") == "* * * * *") {
+            setN(p, "1"); kind = "min";
+        } else if ((cron || "").trim() && p != "copy") {
+            // the cleaner has a custom box, a schedule it cannot show stays visible as one
+            kind = "custom";
+            if (f.length == 5 && f[2] == "*" && f[3] == "*" && f[4] == "*" && /^\d+$/.test(f[0]) && /^\d+$/.test(f[1])) {
+                document.getElementById(p+"_t").value = pad2(f[1])+":"+pad2(f[0]); kind = "day";
+            } else if (f.length == 5 && f[2] == "*" && f[3] == "*" && /^\d$/.test(f[4]) && /^\d+$/.test(f[0]) && /^\d+$/.test(f[1])) {
+                document.getElementById(p+"_t").value = pad2(f[1])+":"+pad2(f[0]);
+                document.getElementById(p+"_d").value = f[4] == 7 ? "0" : f[4]; kind = "week";
+            }
+            if (kind == "custom") { document.getElementById(p+"_c").value = cron; }
+        } else if ((cron || "").trim()) {
+            // a copy schedule the number box cannot show stays visible as custom, APPLY keeps it
+            kind = "custom";
+            document.getElementById(p+"_c").value = cron;
+        }
+        document.getElementById(p+"_kind").value = kind;
+        showKind(p);
+    }
+    var copy_hints = {
+        "": "Movie: the playing file plus subtitles and nfo. Series: the whole season folder.",
+        "folder": "The whole folder of the playing file, subfolders included."
+    };
+    function showCopyHint() {
+        var v = document.getElementById("copy_scope").value;
+        document.getElementById("copy_hint").textContent = copy_hints[v] !== undefined ? copy_hints[v] : "";
+    }
+    function applyAll(command) {
+        function pcNeed(el, msg) {
+            if (el.value.replace(/[ ,]/g, "") == "") { alert(msg); el.focus(); return false; }
+            return true;
+        }
+        // clearing the cron must work even with empty fields, clear just saves what is on screen
+        if (command != "clear") {
+            if (!pcNeed(document.querySelector("#cmform [name='media_folders']"), "Media subfolders is required: list at least one folder name, for example TvShows,Movies")) { return; }
+            if (!pcNeed(document.getElementById("mediaserver_type"), "Pick a Media Server Type")) { return; }
+            if (!pcNeed(document.getElementById("mediaserver_host"), "Address is required: the IP or hostname of the media server")) { return; }
+            if (!pcNeed(document.getElementById("mediaserver_port"), "Port is required: it is filled in when you pick the Type")) { return; }
+            if (!pcNeed(document.getElementById("mediaserver_key"), "API Key is required: the key of your media server")) { return; }
+            if (document.getElementById("copy_kind").value == "min") {
+                var cn = document.getElementById("copy_n").value;
+                if (!/^\d+$/.test(cn) || +cn < 1 || +cn > 59) { alert("Copy schedule: every how many minutes? Use a whole number between 1 and 59"); document.getElementById("copy_n").focus(); return false; }
+            }
+        }
+        document.getElementById("cmcommand").value = "/usr/local/emhttp/plugins/playback-cache/scripts/cache_crons.sh";
+        var arg = document.getElementById("cmarg");
+        arg.value = (command == "clear") ? "clear" : "";
+        // update.php runs #command through realpath, arguments only travel in #arg
+        arg.disabled = (command != "clear");
+        document.getElementById("copy_cron").value = buildCron('copy');
+        document.getElementById("clean_cron").value = buildCron("clean");
+        // rewrites are typed one per line, the settings file keeps them comma separated
+        var rw = document.getElementById("path_mappings");
+        var lines = rw.value.split("\n"), kept = [], i, line;
+        for (i = 0; i < lines.length; i++) {
+            line = lines[i].trim();
+            if (line == "") { continue; }
+            // a line the copy script would only warn about and skip is refused here,
+            // it never gets saved to be silently ignored later, clear still just clears
+            if (command != "clear") {
+                if (line.indexOf(":") < 0) { alert("Mapping line '" + line + "' is not a source:target pair, it needs a : between the server path and the host path"); rw.focus(); return; }
+                if (line.indexOf(":", line.indexOf(":") + 1) >= 0) { alert("Mapping line '" + line + "' looks like two mappings, use one line per mapping"); rw.focus(); return; }
+            }
+            kept.push(line);
+        }
+        rw.value = kept.join(",");
+        document.getElementById("cmform").submit();
+    }
+</script>
+
+<form markdown="1" id="cmform" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" id="file" name="#file" value="/boot/config/plugins/playback-cache/playback-cache.cfg" />
+<input type="hidden" id="cmcommand" name="#command" value="" />
+<input type="hidden" id="cmarg" name="#arg[]" value="" disabled />
+
+<div id="pc_strip" style="margin:0 0 16px 0;padding:9px 12px;border:1px solid #666;overflow:hidden;">
+<span id="pc_status">Checking status…</span>
+<span style="float:right;white-space:nowrap;"><input type="button" id="pc_run_copy" value="RUN COPY" onClick="pcRun('copy');" style="display:inline-block;width:auto;min-width:86px;margin:0;padding:4px 14px;"> <input type="button" id="pc_run_clean" value="RUN CLEAN" onClick="pcRun('clean');" style="display:inline-block;width:auto;min-width:86px;margin:0;padding:4px 14px;"> <input type="button" id="pc_cancel" value="CANCEL" onClick="pcCancel();" style="display:none;width:auto;min-width:86px;margin:0;padding:4px 14px;"></span>
+</div>
+
+<div class="title"><span class="left"><i class="fa fa-hand-peace-o title"></i>Playback Cache</span></div>
+
+Media subfolders:
+: <input type="text" name="media_folders" maxlength="99" style="width:100%;" value="<?=htmlspecialchars($pcsettings_media_folders, ENT_QUOTES);?>" placeholder="TvShows,Movies" >
+<blockquote class='inline_help'>
+        <p>Folders to handle, comma separated. Only files below a folder with one of these names are cached.</p>
+        <p>Example: "TvShows,Movies" caches /mnt/user/Media/Movies/... and ignores everything else.</p>
+        <p>A name may contain spaces: "Tv Shows,Classic Movies".</p>
+</blockquote>
+
+Never cache these:
+: <input type="text" name="never_cache" maxlength="99" style="width:100%;" value="<?=htmlspecialchars($pcsettings_never_cache, ENT_QUOTES);?>" placeholder="Trailers,Extras" >
+<blockquote class='inline_help'>
+        <p>Optional. Folder names that are never cached even below a Media subfolder, comma separated.</p>
+        <p>Example: "Trailers,Extras".</p>
+</blockquote>
+
+Target pool:
+: <?=sel("cache_pool", $pcsettings_cache_pool, $pool_options);?> <span style="display:block;margin-top:2px;">The pool selected here must also be the share's <b>Primary storage</b></span>
+<blockquote class='inline_help'>
+        <p>Pool the media is copied to. One pool only.</p>
+        <p>The list shows real pools only: unRAID pools and ZFS pools.</p>
+        <p>Important: The pool selected here must also be the share's <b>Primary storage</b>. If the share still points at the array, or <b>Primary storage</b> is set to another pool, the plugin will not work as intended and the disks <b>will spin up</b>.</p>
+</blockquote>
+
+Cache Copy Mode:
+: <?=sel("copy_scope", $pcsettings_copy_scope, array("" => "Files in use", "folder" => "Always the whole folder"), ' id="copy_scope" onchange="showCopyHint()"');?> <span id="copy_hint" style="display:block;margin-top:2px;"></span>
+<blockquote class='inline_help'>
+        <p><b>Files in use:</b> for a movie, the playing file plus the subtitles and nfo next to it, nothing from subfolders. For a series episode, the whole season folder, subfolders included, because the next episode is the likely next click.</p>
+        <p><b>Always the whole folder:</b> everything in the playing file's folder, subfolders included, for movies and series alike.</p>
+        <p>"Never cache these" only stops caching when the playing file itself is inside such a folder. Subfolders with those names are still copied whenever a whole folder is copied.</p>
+</blockquote>
+
+Open file handles:
+: <?php if ($gdb_status == "ok") { echo '<span style="white-space:nowrap;">Will switch to the cache copy while playback continues, <b class="green" style="display:inline !important;">gdb is available</b></span>'; } elseif ($gdb_status == "nopython") { echo 'Switching needs gdb but <b class="red" style="display:inline !important;">gdb cannot find python3</b>, re-run the plugin install, it installs both, the plugin still copies and leaves the open handles on the array'; } elseif ($gdb_status == "broken") { echo 'Switching needs gdb but <b class="red" style="display:inline !important;">gdb does not run</b> (' . htmlspecialchars(substr($gdb_out, 0, 90)) . '), the plugin still copies and leaves the open handles on the array'; } else { echo 'Switching needs gdb but <b class="red" style="display:inline !important;">gdb was not found</b>, re-run the plugin install, the plugin still copies and leaves the open handles on the array'; } ?>
+<blockquote class='inline_help'>
+        <p>Once the copy is complete the open handle moves from the array to the cache copy, so the array disk can spin down while you keep watching. This needs the gdb package, which the plugin installs. gdb itself uses python3, so the plugin installs that too when it is missing. Without gdb the plugin logs it and leaves the handle where it is.</p>
+</blockquote>
+
+<div class="title"><span class="left"><i class="fa fa-hand-peace-o title"></i>Media Server</span></div>
+
+Type:
+: <?=sel("mediaserver_type", $pcsettings_mediaserver_type, array("jelly" => "Jellyfin", "emby" => "Emby", "plex" => "Plex"), ' id="mediaserver_type" onchange="fillPort()"');?>
+<blockquote class='inline_help'>
+        <p>The media server the plugin asks what is playing.</p>
+</blockquote>
+
+Address:
+: <input type="text" id="mediaserver_host" name="mediaserver_host" class="narrow" maxlength="99" value="<?=htmlspecialchars($pcsettings_mediaserver_host, ENT_QUOTES);?>" placeholder="192.168.1.71" >
+<blockquote class='inline_help'>
+        <p>IP or hostname of the media server, IP preferred. Example: "192.168.1.71".</p>
+</blockquote>
+
+Port:
+: <input type="text" id="mediaserver_port" name="mediaserver_port" class="narrow" maxlength="99" value="<?=htmlspecialchars($pcsettings_mediaserver_port, ENT_QUOTES);?>" placeholder="8096" >
+
+API Key:
+: <input type="password" id="mediaserver_key" name="mediaserver_key" maxlength="99" style="width:55%;" value="<?=htmlspecialchars($pcsettings_mediaserver_key, ENT_QUOTES);?>" > <span style="display:block;margin-top:2px;white-space:nowrap;"><input type="button" value="TEST" onClick="testMediaServer();" style="display:inline-block;width:auto;min-width:86px;margin:0;padding:8px 14px;vertical-align:middle;"> <span id="test_result" style="margin-left:12px;vertical-align:middle;"></span></span>
+<blockquote class='inline_help'>
+        <p>For <b>Jellyfin</b>: go to <b>Dashboard</b>, API keys, click <b>New API Key</b>, give it a name and click <b>Create</b></p>
+        <p>For <b>Emby</b>: go to <b>Manage Emby Server</b>, Api Keys, click <b>New Api Key</b>, give it a name and click <b>Submit</b></p>
+        <p>For <b>Plex</b>: see https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/</p>
+        <p><b>TEST</b> checks type, host, port and key exactly as typed, nothing needs to be saved first.</p>
+</blockquote>
+
+Mappings:
+: <textarea id="path_mappings" name="path_mappings" rows="5" maxlength="511" style="width:100%;min-width:75ch;font-family:bitstream;resize:vertical;" placeholder="/data/tvshows:/mnt/user/Media/TvShows&#10;/data/movies:/mnt/user/Media/Movies"><?=htmlspecialchars(str_replace(",", "\n", $pcsettings_path_mappings));?></textarea>
+<blockquote class='inline_help'>
+        <p>Maps the paths your media server reports to host paths, as "container_path:host_path". Needed when the container mounts the media under a different path than the host.</p>
+        <p>Check the Docker edit screen: Container Path : Path is exactly what goes here. One mapping per line, a path may contain spaces, trailing slashes are ignored.</p>
+        <p>Empty when the server already reports /mnt/user/... paths.</p>
+</blockquote>
+
+Waiting time:
+: <input type="number" name="wait_minutes" min="0" max="999" style="width:80px;" value="<?=htmlspecialchars($pcsettings_wait_minutes, ENT_QUOTES);?>" placeholder="2" > minutes
+<blockquote class='inline_help'>
+        <p>Minutes media must be playing before anything is copied, so browsing, previews and short skipping do not fill the pool.</p>
+        <p>The item the media server reports has to still be playing when the time is up.</p>
+</blockquote>
+
+<div class="title"><span class="left"><i class="fa fa-hand-peace-o title"></i>Cache Cleaner</span></div>
+
+Keep everything for at least:
+: <input type="number" name="keep_hours" min="0" max="9999" style="width:80px;" value="<?=htmlspecialchars($pcsettings_keep_hours, ENT_QUOTES);?>" placeholder="24" > hours
+<blockquote class='inline_help'>
+        <p>The minimum hours a folder must sit untouched on the cache before the cleaner releases it.</p>
+        <p>Files that already have an identical copy on the array are removed from the cache, everything else stays and the mover handles it.</p>
+</blockquote>
+
+Keep these folders:
+: <input type="text" name="keep_long_folders" maxlength="99" style="width:100%;" value="<?=htmlspecialchars($pcsettings_keep_long_folders, ENT_QUOTES);?>" placeholder="TvShows" >
+<blockquote class='inline_help'>
+        <p>Folders that keep their cache copies for at least the longer time below, comma separated.</p>
+        <p>Use the same names as in Media subfolders. Example: "TvShows".</p>
+        <p>Empty = the keep time above applies everywhere.</p>
+</blockquote>
+
+For at least:
+: <input type="number" name="keep_hours_long" min="0" max="9999" style="width:80px;" value="<?=htmlspecialchars($pcsettings_keep_hours_long, ENT_QUOTES);?>" placeholder="720" > hours
+<blockquote class='inline_help'>
+        <p>Hours those folders sit untouched before the cleaner runs on them.</p>
+        <p>Usually longer, because a whole season is copied at once. Example: 720 = 30 days.</p>
+</blockquote>
+
+<div class="title"><span class="left"><i class="fa fa-hand-peace-o title"></i>Mover Tuning</span></div>
+
+List filepath:
+: <input type="text" name="exclusion_list" maxlength="99" style="width:100%;" value="<?=htmlspecialchars($pcsettings_exclusion_list, ENT_QUOTES);?>" placeholder="/mnt/user/system/playback_cache/exclusion.txt" >
+<blockquote class='inline_help'>
+        <p>One cached folder per line. The copy job adds folders, the cleaner and the Cached tab remove them.</p>
+        <p>This file is also the <b>"Mover Tuning"</b> plugin ignore list: set the same path in its settings, that is what stops the mover from moving the cache copies back to the array.</p>
+        <p>Put it on a share that survives a reboot, the plugin creates the folder when it is missing.</p>
+</blockquote>
+
+<div class="title"><span class="left"><i class="fa fa-hand-peace-o title"></i>Logging and Notifications</span></div>
+
+syslog:
+: <?=sel("log_to_syslog", $pcsettings_log_to_syslog == "yes" ? "yes" : "no", array("yes" => "yes", "no" => "no"));?>
+<blockquote class='inline_help'>
+        <p>"yes" also logs to syslog, so the lines show up in the unRAID system log.</p>
+        <p>The plugin always writes its own log file, the Log tab reads that one.</p>
+</blockquote>
+
+Unraid Notifications:
+: <?=sel("notifications", $pcsettings_notifications == "yes" ? "yes" : "no", array("no" => "no", "yes" => "yes"));?>
+<blockquote class='inline_help'>
+        <p>"yes" sends an Unraid notification on copy, removal and when a cache copy is not complete on the array.</p>
+</blockquote>
+
+rsync copy command:
+: <input type="text" name="rsync_command" maxlength="99" style="width:100%;" value="<?=htmlspecialchars($pcsettings_rsync_command, ENT_QUOTES);?>" placeholder="rsync -a --mkpath" >
+<blockquote class='inline_help'>
+        <p>The rsync command used to copy from array to cache. Default: "rsync -a --mkpath", --mkpath needs rsync 3.2.3 or newer.</p>
+        <p>Change on your own risk, the command is run as typed. Keep -a, the cleaner trusts the timestamps it preserves.</p>
+</blockquote>
+
+<div class="title"><span class="left"><i class="fa fa-hand-peace-o title"></i>Schedule</span></div>
+
+Copy Schedule:
+: <select id="copy_kind" style="width:auto;" onchange="showKind('copy')"><option value="none">Not scheduled</option><option value="min">Every</option><option value="custom">Custom cron</option></select> <input type="number" id="copy_n" data-kind="copy" data-for="min" min="1" max="59" value="10" style="width:60px;"> <span data-kind="copy" data-for="min">&nbsp;minutes</span> <input type="text" id="copy_c" data-kind="copy" data-for="custom" maxlength="31" style="width:260px;" placeholder="minute hour day month weekday" > <input type="hidden" name="copy_cron" id="copy_cron" value="<?=htmlspecialchars($pcsettings_copy_cron, ENT_QUOTES);?>" > <span id="cron_copy_status" style="float:right;"><?=$cron_copy;?></span>
+<blockquote class='inline_help'>
+        <p>How often the plugin looks for playing media. APPLY ALL installs it into the crontab and saves it to the plugin folder, so it survives a reboot. "Not scheduled" removes it.</p>
+</blockquote>
+
+Cleaner Schedule:
+: <select id="clean_kind" style="width:auto;" onchange="showKind('clean')"><option value="none">Not scheduled</option><option value="day">Daily at</option><option value="week">Weekly on</option><option value="custom">Custom cron</option></select> <span data-kind="clean" data-for="week"><select id="clean_d" style="width:auto;"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></select>&nbsp;at</span> <input type="time" id="clean_t" data-kind="clean" data-for="day week" style="width:auto;"> <input type="text" id="clean_c" data-kind="clean" data-for="custom" maxlength="31" style="width:260px;" placeholder="minute hour day month weekday" > <input type="hidden" name="clean_cron" id="clean_cron" value="<?=htmlspecialchars($pcsettings_clean_cron, ENT_QUOTES);?>" > <span id="cron_clean_status" style="float:right;"><?=$cron_clean;?></span>
+<blockquote class='inline_help'>
+        <p>When aged cache copies are removed. Daily at a quiet hour is the normal choice.</p>
+        <p>APPLY ALL installs it into the crontab and saves it to the plugin folder, so it survives a reboot. "Custom cron" takes the 5 usual fields: minute hour day month weekday.</p>
+</blockquote>
+
+<div style="text-align: center; margin-top:12px;">
+    <input type="button" value="APPLY ALL" onClick="applyAll('apply')">
+    <input type="button" value="Clear Cron" onClick="applyAll('clear')">
+</div>
+
+</form>
+
+<script>
+    initSchedule('copy', <?=json_encode((string)$pcsettings_copy_cron);?>);
+    initSchedule('clean', <?=json_encode((string)$pcsettings_clean_cron);?>);
+    showCopyHint();
+    pcPoll();
+    pcTimer = setInterval(pcPoll, 4000);
+</script>
+

@@ -1,0 +1,89 @@
+Menu="playback-cache:3"
+Title="Logs"
+Tag="icon-disk"
+---
+
+<?php
+// the scripts write "copy: ..." and "clean: ..." lines to one log file, split the views here
+$pc_log = (string)@file_get_contents("/var/log/playback-cache.log");
+$text = "";
+$text2 = "";
+foreach (explode("\n", $pc_log) as $pc_line) {
+    if (strpos($pc_line, "copy: ") === 0) { $text .= substr($pc_line, 6)."\n"; }
+    elseif (strpos($pc_line, "clean: ") === 0) { $text2 .= substr($pc_line, 7)."\n"; }
+}
+$text = implode("\n", array_slice(explode("\n", rtrim($text, "\n")), -999));
+$text2 = implode("\n", array_slice(explode("\n", rtrim($text2, "\n")), -999));
+?>
+
+<script>
+    function clearLogs() {
+        if (!confirm("Clear both views?\nThe plugin log file starts fresh, syslog keeps its copy when syslog logging is on.")) { return; }
+        var body = "action=clearlogs";
+        if (typeof csrf_token != "undefined") { body += "&csrf_token=" + encodeURIComponent(csrf_token); }
+        fetch("/plugins/playback-cache/control.php", { method: "POST", cache: "no-store", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: body })
+            .then(function(){ pcFillBox("copy_log_box", ""); pcFillBox("clean_log_box", ""); })
+            .catch(function(){});
+    }
+    function pcSizeBox(box) {
+        // a hidden tab measures zero, sizing it then would collapse the box
+        if (!box || box.offsetParent === null) { return; }
+        // fit the real content height, scrollbar only at the 60vh cap
+        box.style.height = "0px";
+        var max = Math.floor(window.innerHeight * 0.6) - 8;
+        box.style.height = Math.min(box.scrollHeight + 4, max) + "px";
+    }
+    function pcFillBox(id, text) {
+        var box = document.getElementById(id);
+        if (!box) { return; }
+        var nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+        box.value = text;
+        pcSizeBox(box);
+        if (nearBottom) { box.scrollTop = box.scrollHeight; }
+    }
+    function pcFetchLogs() {
+        fetch("/plugins/playback-cache/control.php?action=logs", { cache: "no-store" }).then(function(r){ return r.json(); }).then(function(d){
+            pcFillBox("copy_log_box", d.copy); pcFillBox("clean_log_box", d.clean);
+        }).catch(function(){});
+    }
+    // the webgui loads all tabs at once and only shows one, so watch when this one becomes visible
+    var pcLogsShown = false, pcLogsWhen = 0;
+    setInterval(function() {
+        if (document.hidden) { pcLogsShown = false; return; }
+        var box = document.getElementById("copy_log_box");
+        var shown = !!box && box.offsetParent !== null;
+        var busy = typeof pcRunning != "undefined" && pcRunning.length > 0;
+        // once when the tab opens, then every 2 s while a run is going
+        if (shown && (shown != pcLogsShown || (busy && new Date().getTime() - pcLogsWhen > 2000))) {
+            if (shown != pcLogsShown) {
+                // fit the server rendered content right away, the fetch follows
+                pcSizeBox(document.getElementById("copy_log_box"));
+                pcSizeBox(document.getElementById("clean_log_box"));
+            }
+            pcFetchLogs();
+            pcLogsWhen = new Date().getTime();
+        }
+        pcLogsShown = shown;
+    }, 1000);
+</script>
+
+<div style="margin:0 0 8px 0;text-align:left;"><input type="button" value="REFRESH" onClick="pcFetchLogs()"></div>
+
+<div class="title"><span class="left"><i class="fa fa-hand-peace-o title"></i>Copy Log</span></div>
+<div style="border: 1px solid red;">
+<textarea id="copy_log_box" spellcheck="false" cols="120" rows="3" name="text" style="resize:none;font-family:bitstream;width:100%;max-height:60vh;overflow:auto;" readonly><?=htmlspecialchars($text)?></textarea></div>
+
+<div class="title"><span class="left"><i class="fa fa-hand-peace-o title"></i>Cleaner Log</span></div>
+<div style="border: 1px solid red;">
+<textarea id="clean_log_box" spellcheck="false" cols="120" rows="3" name="text2" style="resize:none;font-family:bitstream;width:100%;max-height:60vh;overflow:auto;" readonly><?=htmlspecialchars($text2)?></textarea></div>
+
+<div style="text-align:left; margin-top:12px;">
+    <input type="button" value="CLEAR LOGS" onClick="clearLogs()">
+</div>
+
+<script>
+    // only does something when this tab is the one shown at page load,
+    // the watcher above sizes the boxes whenever the tab opens
+    pcSizeBox(document.getElementById("copy_log_box"));
+    pcSizeBox(document.getElementById("clean_log_box"));
+</script>

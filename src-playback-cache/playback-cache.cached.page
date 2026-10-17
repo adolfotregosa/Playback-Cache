@@ -1,0 +1,126 @@
+Menu="playback-cache:2"
+Title="Cached"
+Tag="icon-disk"
+---
+
+<?php
+// emhttp runs the php blocks of a .page file through eval(), so __DIR__ here would point
+// into the webGui folder, the include uses the absolute plugin path like control.php does
+require_once("/usr/local/emhttp/plugins/playback-cache/list_details.php");
+$pcsettings            = @parse_ini_file("/boot/config/plugins/playback-cache/playback-cache.cfg", true);
+$pcsettings_exclusion_list        = is_array($pcsettings) && isset($pcsettings['exclusion_list']) ? $pcsettings['exclusion_list'] : "";
+// one implementation shared with control.php, so the numbers here are the cleaner's rules
+$list_rows = pc_list_details("/boot/config/plugins/playback-cache/playback-cache.cfg");
+?>
+
+<script>
+    function toggleAllList(box) {
+        var boxes = document.getElementById("listform").querySelectorAll("input[type=checkbox]");
+        for (var i = 0; i < boxes.length; i++) { boxes[i].checked = box.checked; }
+    }
+    function deleteSelected() {
+        var form = document.getElementById("listform");
+        var n = form.querySelectorAll("input[name='#arg[]']:checked").length;
+        if (n == 0) { alert("Tick the folders you want to release first."); return; }
+        if (confirm("Release " + n + " folder" + (n > 1 ? "s" : "") + " now?\nFiles with an identical copy on the array are removed from the cache, everything else stays.")) {
+            form.submit();
+            // the delete script needs a moment, then pull the list again so the rows disappear
+            pcListLast = "";
+            setTimeout(pcListFetch, 1500);
+        }
+    }
+    function pcSize(b) {
+        if (!b) { return "-"; }
+        var u = ["B","KB","MB","GB","TB"], i = 0;
+        while (b >= 1024 && i < u.length - 1) { b = b / 1024; i++; }
+        return (i == 0 ? b : b.toFixed(1)) + " " + u[i];
+    }
+    function pcAge(h) {
+        if (h === null) { return "no stamp"; }
+        if (h < 1) { return "just now"; }
+        if (h < 48) { return h + " h"; }
+        return Math.floor(h/24) + " d " + (h % 24) + " h";
+    }
+    function pcRelease(h) {
+        if (h === null) { return "-"; }
+        return h > 0 ? "in " + pcAge(h) : "now";
+    }
+    var pcListLast = "";
+    function pcListRender(folders) {
+        var rows = document.getElementById("pc_list_rows");
+        if (!rows) { return; }
+        // the numbers change on their own while a job runs, the ticks the user made stay
+        var ticked = {};
+        rows.querySelectorAll("input:checked").forEach(function(b){ ticked[b.value] = 1; });
+        while (rows.firstChild) { rows.removeChild(rows.firstChild); }
+        for (var i = 0; i < folders.length; i++) {
+            var f = folders[i];
+            var tr = document.createElement("tr");
+            var td1 = document.createElement("td"); td1.style.padding = "2px 8px";
+            var box = document.createElement("input");
+            box.type = "checkbox"; box.name = "#arg[]"; box.value = f.path;
+            box.checked = !!ticked[f.path];
+            td1.appendChild(box);
+            var td2 = document.createElement("td"); td2.style.padding = "2px 8px"; td2.textContent = f.path;
+            var td3 = document.createElement("td"); td3.style.padding = "2px 8px"; td3.style.whiteSpace = "nowrap"; td3.textContent = pcSize(f.size);
+            var td4 = document.createElement("td"); td4.style.padding = "2px 8px"; td4.style.whiteSpace = "nowrap"; td4.textContent = pcAge(typeof f.age == "number" ? f.age : null);
+            var td5 = document.createElement("td"); td5.style.padding = "2px 8px"; td5.style.whiteSpace = "nowrap"; td5.textContent = pcRelease(typeof f.release == "number" ? f.release : null);
+            tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3); tr.appendChild(td4); tr.appendChild(td5);
+            rows.appendChild(tr);
+        }
+        document.getElementById("pc_list_count").textContent = folders.length;
+        document.getElementById("pc_list_empty").style.display = folders.length ? "none" : "";
+        var all = document.getElementById("pc_select_all");
+        if (all) { all.checked = false; }
+    }
+    function pcListFetch() {
+        fetch("/plugins/playback-cache/control.php?action=list", { cache: "no-store" }).then(function(r){ return r.json(); }).then(function(d){
+            // the key covers the numbers too, an ageing list must re-render without a click
+            var key = JSON.stringify(d.folders);
+            if (key == pcListLast) { return; } // same list, keep the ticks the user made
+            pcListLast = key;
+            pcListRender(d.folders);
+        }).catch(function(){});
+    }
+    // same watcher the logs tab uses: refresh when the tab opens, then while a run is going
+    var pcListShown = false, pcListWhen = 0;
+    setInterval(function() {
+        if (document.hidden) { pcListShown = false; return; }
+        var anchor = document.getElementById("pc_list_rows");
+        var shown = !!anchor && anchor.offsetParent !== null;
+        var busy = typeof pcRunning != "undefined" && pcRunning.length > 0;
+        if (shown && (shown != pcListShown || (busy && new Date().getTime() - pcListWhen > 2000))) {
+            pcListFetch();
+            pcListWhen = new Date().getTime();
+        }
+        pcListShown = shown;
+    }, 1000);
+</script>
+
+<div class="title"><span class="left"><i class="fa fa-hand-peace-o title"></i>Playback Cache - Cached folders</span></div>
+
+<form id="listform" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" id="listcommand" name="#command" value="/usr/local/emhttp/plugins/playback-cache/scripts/cache_list_delete.sh" />
+
+<p>Folders currently cached: <span id="pc_list_count"><?=count($list_rows);?></span>, file <code><?=htmlspecialchars($pcsettings_exclusion_list);?></code>.</p>
+<p>Releases the folder: files with an identical copy on the array are removed from the cache, everything else stays for the mover. "Removed in" counts from the last time the folder was played or cached.</p>
+
+<div style='border: 1px solid red; height:auto; max-height:60vh; overflow:auto;'>
+<table>
+<tr><td style="padding:2px 8px;"><input type="checkbox" id="pc_select_all" onClick="toggleAllList(this)"></td><td style="padding:2px 8px;"><b>Select all</b></td><td style="padding:2px 8px;"><b>Size</b></td><td style="padding:2px 8px;"><b>Idle for</b></td><td style="padding:2px 8px;"><b>Removed in</b></td></tr>
+<tbody id="pc_list_rows">
+</tbody>
+</table>
+<p id="pc_list_empty" style="padding:8px;<?=count($list_rows) ? " display:none;" : ""?>">The list is empty, nothing is cached.</p>
+</div>
+
+<div style="text-align:left; margin-top:12px;">
+    <input type="button" value="RELEASE selected" onClick="deleteSelected()">
+</div>
+
+</form>
+
+<script>
+    pcListLast = <?=json_encode(json_encode($list_rows, JSON_UNESCAPED_SLASHES));?>;
+    pcListRender(<?=json_encode($list_rows, JSON_UNESCAPED_SLASHES);?>);
+</script>

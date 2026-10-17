@@ -1,0 +1,651 @@
+#!/bin/bash
+# Playback Cache - unRAID plugin
+
+################################
+source /boot/config/plugins/playback-cache/playback-cache.cfg
+################################
+
+### cron and webui launches can carry a minimal PATH
+PATH="$PATH:/usr/bin:/usr/local/bin:/bin"
+
+################################
+### one run at a time, the lock is taken before anything is written
+exec 9> /var/run/playback-cache-copy.lock
+flock -n 9 || exit 0
+
+################################
+### everything is logged to the plugin log file, syslog is an extra when it is on,
+### the redirect comes first so even early errors land in the log
+pc_logfile="/var/log/playback-cache.log"
+pc_size=$(stat -c %s "$pc_logfile" 2> /dev/null)
+if [ "${pc_size:-0}" -gt 1048576 ]; then
+	### trim in place, cat > keeps the inode the other script may be appending to,
+	### the lock keeps the two scripts from trimming over each other
+	(
+		flock -w 10 7 || exit 0
+		tail -n 2000 "$pc_logfile" > "$pc_logfile.tmp" 2> /dev/null && cat "$pc_logfile.tmp" > "$pc_logfile"
+		rm -f "$pc_logfile.tmp"
+	) 7> /var/run/playback-cache-log.lock
+fi
+### control.php starts a manual run with "now", a human is asking right here so the waiting time is skipped
+pc_now=0
+[ "${1:-}" = "now" ] && pc_now=1
+
+### the log file keeps the whole story of a manual run, a cron run only the events,
+### syslog only ever sees what really happened, manual run or not
+pc_syslog="no"
+[ "$log_to_syslog" == "yes" ] && pc_syslog="yes"
+exec > >(while IFS= read -r pc_line; do
+	case "$pc_line" in
+		"caching "*|*"switched to cache:"*|*"already on cache:"*|*"changed under us:"*|gdb\ *|"rsync failed:"*|ERROR:*|WARN:*|"cancel requested,"*|"no usable answer"*)	pc_event=1 ;;
+		*)	pc_event=0 ;;
+	esac
+	if [ $pc_now -eq 0 ] && [ $pc_event -eq 0 ]; then continue; fi
+	printf 'copy: %(%F %T)T %s\n' -1 "$pc_line" >> "$pc_logfile"
+	if [ "$pc_syslog" == "yes" ] && [ $pc_event -eq 1 ]; then logger "playback-cache: copy: ${pc_line}"; fi
+done)
+### bash's own errors get the ERROR: mark, so cron keeps them too
+exec 2> >(while IFS= read -r l; do printf 'ERROR: %s\n' "$l"; done)
+
+### list settings are comma seperated, spaces inside a value are allowed
+list_to_regex() { # $1 setting value, comma seperated list -> regex
+	case "$1" in
+		*,*)	echo "$1" | sed 's/ *, */,/g; s/,,*/,/g; s/^,//; s/,$//; s/,/|/g; s/^ *//; s/ *$//' ;;
+		*)	echo "$1" | sed 's/^ *//; s/ *$//' ;;
+	esac
+}
+
+list_warn() { # $1 setting name, $2 value, the old space seperated style is not supported
+	case "$2" in
+		*,*|"")	;;
+		*[[:space:]]*)	echo "WARN: $1: read as one value, use a comma to separate several values" ;;
+	esac
+}
+
+list_warn "Media subfolders" "$media_folders"
+list_warn "Never cache these" "$never_cache"
+
+media_folders=$(list_to_regex "$media_folders")
+never_cache=$(list_to_regex "$never_cache")
+
+### the subfolder filter is required, an empty regex would match every file
+if [ -z "$media_folders" ]; then
+	echo "ERROR: subfolders setting is empty, add at least one folder name in the plugin settings"
+	exit 1
+fi
+
+### what a media file is and what comes along with it, not user facing
+video_regex="\.(mkv|mp4|m4v|ts|m2ts|avi|mov|webm|wmv|flv|iso|strm)([[:space:]]|$)"
+sidecar_regex="\.(srt|ass|ssa|sub|idx|vtt|sami|smi|usf|sup|nfo)([[:space:]]|$)"
+
+### remove leading trailing slashes, the mount check below needs the clean name
+cache_pool="${cache_pool#/}"
+cache_pool="${cache_pool%/}"
+
+################################
+### status for the webui, written through a temp file so a reader never sees a half line
+pc_state() { # $1 run|end, $2 text
+	printf '%s|%s|%s|%s\n' "$$" "$1" "$(date +%s)" "$2" > "/var/run/playback-cache-copy.state.tmp" 2> /dev/null
+	mv -f "/var/run/playback-cache-copy.state.tmp" "/var/run/playback-cache-copy.state" 2> /dev/null
+}
+PC_RESULT="nothing to copy"
+trap 'pc_state end "$PC_RESULT"' EXIT
+pc_state run "starting"
+### a cancel is only for the run that was going when it was pressed, copy and clean have their own flag
+rm -f /var/run/playback-cache-copy.cancel
+
+### an unmounted pool would turn rsync --mkpath into a write into the RAM /mnt, stop before that
+if ! awk -v m="/mnt/$cache_pool" '$2 == m { f = 1 } END { exit !f }' /proc/mounts; then
+	echo "ERROR: /mnt/$cache_pool is not mounted, breaking here"
+	PC_RESULT="pool not mounted"
+	exit 1
+fi
+
+### the Jellyfin and Emby api answers are json, jq is a hard requirement for them
+if [ "$mediaserver_type" != "plex" ] && ! command -v jq > /dev/null 2>&1; then
+	echo "ERROR: jq is needed for the media server api, install the jq package"
+	PC_RESULT="jq missing"
+	exit 1
+fi
+
+pc_cancelled() { # $1 result text, the webui asked to stop, checked between files so the current one stays complete
+	if [ -f /var/run/playback-cache-copy.cancel ]; then
+		rm -f /var/run/playback-cache-copy.cancel
+		echo "cancel requested, stopping here, everything copied so far is complete"
+		PC_RESULT="$1"
+		return 0
+	fi
+	return 1
+}
+
+### rsync 3.4 prints a whole stats block per call, only failures are worth a syslog line
+pc_rsync() { # $1 source, $2 target
+	local out rc
+	out=$($rsync_command --quiet "$1" "$2" 2>&1); rc=$?
+	if [ $rc -ne 0 ]; then
+		echo "rsync failed: $(printf '%s' "$out" | head -n 2 | tr '\n' ' ')"
+		PC_RESULT="copy failed"
+		return 1
+	fi
+	return 0
+}
+
+################################
+### other mounts are found through the media server path itself, no mount scanning needed
+
+
+################################
+### the working list of cached folders, one file, Mover Tuning points at the same path,
+### the copy job writes it and the cleaner reads it, it is the heart of the plugin
+if [ -z "$exclusion_list" ]; then
+	echo "ERROR: the list file path is empty, set it in the plugin settings"
+	exit 1
+fi
+mkdir -p "$(dirname "$exclusion_list")" 2> /dev/null
+if ! touch "$exclusion_list" 2> /dev/null; then
+	echo "ERROR: cannot write the list file $exclusion_list, check its folder"
+	exit 1
+fi
+chmod 644 "$exclusion_list" 2> /dev/null
+
+################################
+### the list feeds the cleaner's rm and the mover exclusion, every write goes through one
+### lock, a lost line would leave a cached folder untracked and unprotected from the mover
+list_lock="/var/run/playback-cache-list.lock"
+stamps_file="${exclusion_list}.stamps"
+with_list_lock() { # runs the command with the list lock held, fd 8, the run lock owns 9
+	(
+		flock 8
+		"$@"
+	) 8> "$list_lock"
+}
+### the cleaner ages from these stamps, atime is not a clock: relatime bumps it on every
+### library scan, a long keep would never expire
+stamp_folder() { # $1 folder, (re)starts its keep timer
+	[ -z "$exclusion_list" ] && return 0
+	local stamp_tmp
+	stamp_tmp=$(mktemp) 2> /dev/null || return 1
+	{ awk -F '\t' -v f="$1" '$2 != f' "$stamps_file" 2> /dev/null; printf '%s\t%s\n' "$(date +%s)" "$1"; } > "$stamp_tmp" 2> /dev/null && mv "$stamp_tmp" "$stamps_file" 2> /dev/null
+	rm -f "$stamp_tmp" 2> /dev/null
+}
+unstamp_folder() { # $1 folder, forgets its keep timer
+	[ -z "$exclusion_list" ] && return 0
+	[ -f "$stamps_file" ] || return 0
+	local stamp_tmp
+	stamp_tmp=$(mktemp) 2> /dev/null || return 1
+	awk -F '\t' -v f="$1" '$2 != f' "$stamps_file" > "$stamp_tmp" 2> /dev/null && mv "$stamp_tmp" "$stamps_file" 2> /dev/null
+	rm -f "$stamp_tmp" 2> /dev/null
+}
+add_to_list() { # $1 folder, list line plus fresh stamp, called under the lock
+	printf '%s\n' "$1" >> "$exclusion_list" 2> /dev/null
+	awk -i inplace '!seen[$0]++' "$exclusion_list" 2> /dev/null
+	stamp_folder "$1"
+}
+
+################################
+tmpdir="/var/run/playback-cache"
+mkdir -p "$tmpdir" 2> /dev/null
+proc_openfiles="$tmpdir/proc_openfiles.txt"
+gdb_cmds="$tmpdir/gdb_cmds.txt"
+pc_switched="$tmpdir/switched"
+
+### fallback for the rsync command, a local copy needs no compression
+[ -z "$rsync_command" ] && rsync_command="rsync -a --mkpath"
+
+################################
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+
+### rewrite mappings, one source:target pair per entry, the page stores them comma separated, newlines are accepted too
+rewrite_list=()
+if [ ! -z "$path_mappings" ]; then
+	while IFS= read -r rewrite_pair; do
+		rewrite_pair="${rewrite_pair#"${rewrite_pair%%[![:space:]]*}"}"
+		rewrite_pair="${rewrite_pair%"${rewrite_pair##*[![:space:]]}"}"
+		if [ -z "$rewrite_pair" ]; then
+			continue
+		fi
+		case "$rewrite_pair" in
+			*:*:**)	echo "WARN: Mappings: '$rewrite_pair' looks like two mappings, use one line per mapping" ;;
+			*:*)	rewrite_list+=( "$rewrite_pair" ) ;;
+			*)	echo "WARN: Mappings: '$rewrite_pair' is not a source:target pair, skipped" ;;
+		esac
+	done <<< "$(printf '%s' "$path_mappings" | tr ',' '\n')"
+fi
+
+apply_rewrite() { # $1 path as the media server reports it, prints the same path on the host
+	local path="$1" rewrite rew_source rew_target
+	for rewrite in "${rewrite_list[@]}"
+		do
+		### skip empty values and values without a target
+		case "$rewrite" in
+			*:*?*) ;;
+			*) continue ;;
+		esac
+		rew_source="${rewrite%%:*}"
+		rew_target="${rewrite#*:}"
+		rew_source="${rew_source%/}"
+		rew_target="${rew_target%/}"
+		case "$path" in
+			"$rew_source"/*)
+				path="/${rew_target#/}${path#"$rew_source"}"
+				break
+				;;
+		esac
+		done
+	printf '%s' "$path"
+}
+
+### api access, Jellyfin 12 dropped the /emby route prefix and the api_key and X-Emby-Token auth,
+### the Authorization header is what is left and every server version accepts it
+api_prefix=""
+if [ "$mediaserver_type" == "emby" ]; then
+	api_prefix="/emby"
+fi
+ms_scheme=""
+ms_url_scheme() { # echoes http or https, probes the server once per run and remembers,
+	### -k because self-signed certificates are the norm on a lan, test_server.php uses the same flags
+	if [ -z "$ms_scheme" ]; then
+		if curl -s -k -m 5 -o /dev/null "https://$mediaserver_host:$mediaserver_port/"; then
+			ms_scheme="https"
+		else
+			ms_scheme="http"
+		fi
+	fi
+	echo "$ms_scheme"
+}
+api_call() { # $1 full api path, prints the response body, empty on failure
+	curl -s -k -m 10 -H "Authorization: MediaBrowser Token=\"$mediaserver_key\"" "$(ms_url_scheme)://$mediaserver_host:$mediaserver_port$1" 2> /dev/null
+}
+
+################################
+### the item the current pass works on
+openpath=""
+diskpath=""
+diskname=""
+poolpath=""
+rsync_source=""
+rsync_target=""
+item_type=""
+copy_mode="files"
+copied_paths=""
+
+### array and pool path of a media file
+set_item() { # $1 the media file on the array
+	diskpath="$1"
+	diskname=$(printf '%s' "$diskpath" | cut -f 3 -d "/")
+	if [ "$diskname" == "disks" ]; then
+		diskname="$diskname/$(printf '%s' "$diskpath" | cut -f 4 -d "/")"
+	fi
+	poolpath="/mnt/$cache_pool/${diskpath#"/mnt/$diskname/"}"
+	rsync_source=$(dirname "$diskpath")
+	rsync_target=$(dirname "$poolpath")
+}
+
+################################
+### media server mode, ask the server what is playing and what kind of item it is
+ask_playing() { # prints "type<TAB>server path" for every playing item, 2 means the api did not answer
+	local keys k playing sessions meta ptype
+	if [ "$mediaserver_type" == "plex" ]; then
+		keys=$(curl -s -k -m 10 "$(ms_url_scheme)://$mediaserver_host:$mediaserver_port/status/sessions?X-Plex-Token=$mediaserver_key" 2> /dev/null | grep -oP 'ratingKey="\K[^"]+' | sort -u)
+		for k in $keys
+			do
+			### one call per item: the metadata answer holds the file path and the type
+			meta=$(curl -s -k -m 10 "$(ms_url_scheme)://$mediaserver_host:$mediaserver_port/library/metadata/$k?X-Plex-Token=$mediaserver_key" 2> /dev/null)
+			ptype=$(printf '%s' "$meta" | grep -oP '<Video[^>]*\btype="\K[^"]+' | head -n 1)
+			case "$ptype" in
+				movie)		ptype="Movie" ;;
+				episode)	ptype="Episode" ;;
+				*)		ptype="" ;;
+			esac
+			playing=$(printf '%s' "$meta" | grep -oP 'file="\K[^"]+' | grep -E "$media_folders" | sed '$!d' | sed "s/&lt;/</g; s/&gt;/>/g; s/&quot;/\"/g; s/&#34;/\"/g; s/&apos;/'/g; s/&#39;/'/g; s/&amp;/\&/g")
+			[ -z "$playing" ] && continue
+			printf '%s\t%s\n' "$ptype" "$playing"
+			done
+		return 0
+	fi
+	sessions=$(api_call "$api_prefix/Sessions")
+	if [ -z "$sessions" ]; then
+		return 2
+	fi
+	if ! printf '%s' "$sessions" | jq -e 'type == "array"' > /dev/null 2>&1; then
+		### stdout here is captured as data by the caller, stderr gets the ERROR: mark
+		echo "the media server answer is not a session list" >&2
+		return 2
+	fi
+	### every playing item, its type tells us what to copy, an episode is never alone, a movie is
+	printf '%s' "$sessions" | jq -c '.[] | select(.NowPlayingItem != null) | { type: (.NowPlayingItem.Type // ""), path: (.NowPlayingItem.Path // "") }' | grep -v '"path":""' | while IFS= read -r item
+		do
+		printf '%s\t%s\n' "$(printf '%s' "$item" | jq -r '.type')" "$(printf '%s' "$item" | jq -r '.path')"
+		done
+}
+
+### turn one server path into the host paths the copy works with
+resolve_item() { # $1 server path, sets openpath/diskpath/poolpath/rsync_*/srcmnt, rc 1 means skip this item
+	local relpath src_dir dev
+	### the server reports the path inside its own mount, turn it into the host path
+	openpath=$(apply_rewrite "$1")
+	echo "playing: $item_type $openpath"
+	### the host path is the array path or the pool path of the same file
+	srcmnt=""
+	case "$openpath" in
+		/mnt/user/*)	relpath="${openpath#/mnt/user/}" ;;
+		/mnt/$cache_pool/*)	relpath="${openpath#/mnt/$cache_pool/}" ;;
+		/mnt/disk[0-9]*/*)	relpath="${openpath#/mnt/disk*/}" ;;
+		### an unassigned device holds this file: the device itself is the source mount,
+		### the relative path stays share relative like on every other mount
+		/mnt/disks/*/*)	relpath="${openpath#/mnt/disks/*/}"; dev="${openpath#/mnt/disks/}"; srcmnt="/mnt/disks/${dev%%/*}" ;;
+		/mnt/*/*)	relpath="${openpath#/mnt/*/}"; srcmnt="${openpath#/mnt/}"; srcmnt="/mnt/${srcmnt%%/*}" ;;
+		*)	relpath="" ;;
+	esac
+	if [ -z "$relpath" ]; then
+		echo "ERROR: the server path $1 is not under /mnt on the host, add a mapping"
+		return 1
+	fi
+	### the exact path on the array, no globbing, an Extended cut must never win over the playing file
+	diskpath=""
+	if [ ! -z "$srcmnt" ]; then
+		[ -f "$srcmnt/$relpath" ] && diskpath="$srcmnt/$relpath"
+	else
+		for src_dir in /mnt/disk* /mnt/disks/*
+			do
+			[ -f "$src_dir/$relpath" ] && { diskpath="$src_dir/$relpath"; break; }
+			done
+	fi
+	if [ -z "$diskpath" ]; then
+		### not on the array, pool only media
+		poolpath=""
+		rsync_source=""
+		rsync_target=""
+		return 0
+	fi
+	set_item "$diskpath"
+}
+
+################################
+### what to copy, the media server decides, an episode is never alone, a movie is
+decide_copy_mode() {
+	if [ "$copy_scope" == "folder" ]; then
+		copy_mode="folder"
+	elif [ -z "$item_type" ] || [ "$item_type" == "Episode" ]; then
+		### no media server answer, keep copying the whole folder like this plugin always did
+		copy_mode="folder"
+	else
+		copy_mode="files"
+	fi
+}
+
+### the array files that belong to the playing item and where they land on the pool
+build_copy_list() {
+	local sidecar
+
+	copy_sources=()
+	copy_targets=()
+	if [ "$copy_mode" == "folder" ]; then
+		copy_sources+=( "$rsync_source/" )
+		copy_targets+=( "$rsync_target/" )
+	else
+		copy_sources+=( "$diskpath" )
+		copy_targets+=( "$poolpath" )
+		### subtitles and info files sitting next to the playing file
+		while IFS= read -r sidecar
+			do
+			copy_sources+=( "$sidecar" )
+			copy_targets+=( "${sidecar/"$rsync_source"/"$rsync_target"}" )
+			done < <(find "$rsync_source" -maxdepth 1 -type f 2> /dev/null | grep -iE "$sidecar_regex")
+	fi
+	copied_paths=$(printf '%s\n' "${copy_sources[@]}")
+}
+
+### the same file shows up under many mount points: /mnt/diskN, /mnt/user, the pool or a
+### ZFS mount, the share relative path is the one form all of them agree on, only the
+### mounts that can hold this file count, a backup copy on an unassigned device is a
+### different file and its handles stay untouched
+pc_rel() { # any host path of one of our files -> share relative path, empty if not ours
+	case "$1" in
+		/mnt/user/*|/mnt/user0/*|/mnt/disk[0-9]*/*|"/mnt/$cache_pool"/*)	printf '%s' "${1#/mnt/*/}" ;;
+		"$srcmnt"/*)	[ ! -z "$srcmnt" ] && printf '%s' "${1#"$srcmnt"/}" ;;
+	esac
+}
+
+### is this open handle one of the files we are working on, compared share relative
+is_cached_file() { # $1 host path of the handle
+	local rel c_path c_rel
+	rel=$(pc_rel "$1")
+	if [ -z "$rel" ]; then
+		return 1
+	fi
+	if [ "$copy_mode" == "folder" ]; then
+		case "$rel" in
+			"$(pc_rel "$rsync_source")/"*)	return 0 ;;
+		esac
+		return 1
+	fi
+	while IFS= read -r c_path
+		do
+		c_rel=$(pc_rel "$c_path")
+		if [ -n "$c_rel" ] && [ "$c_rel" == "$rel" ]; then
+			return 0
+		fi
+		done <<< "$copied_paths"
+	return 1
+}
+
+### move or close the handles of those files, only when the cache copy of that file is complete
+switch_handles() {
+	local process_id file_descr openpath hostpath cache_copy switch_to switch_esc scan_line
+
+	if ! gdb --version > /dev/null 2>&1; then
+		gdb_err=$(gdb --version 2>&1 | head -n 1)
+		case "$gdb_err" in *libpython*) gdb_err="$gdb_err, gdb needs the python3 package";; esac
+		echo "gdb does not run: $gdb_err, the open handle stays on the array"
+		return 0
+	fi
+	### find reads every link target in one pass, ls would hit the argument limit on busy servers,
+	### -maxdepth has to come after the paths, findutils 4.10 refuses it before them
+	find /proc/[0-9]*/fd -maxdepth 1 -lname '*.*' ! -lname '* (deleted)' -printf '%p\t%l\n' 2> /dev/null | grep -iE "$video_regex|$sidecar_regex" > "$proc_openfiles"
+	### forget switched handles of processes that are gone
+	if [ -s "$pc_switched" ]; then
+		while IFS=$'\t' read -r spid sfd spath
+			do
+			[ -d "/proc/$spid" ] && printf '%s\t%s\t%s\n' "$spid" "$sfd" "$spath"
+			done < "$pc_switched" > "$pc_switched.tmp" 2> /dev/null
+		mv "$pc_switched.tmp" "$pc_switched" 2> /dev/null
+	fi
+	while IFS=$'\t' read -r scan_line openpath
+		do
+		process_id="${scan_line#/proc/}"; process_id="${process_id%%/*}"
+		file_descr="${scan_line##*/}"
+		### the fd can be gone already, find and the switch are not one atomic step
+		if [ ! -d "/proc/$process_id" ] || [ ! -L "/proc/$process_id/fd/$file_descr" ]; then
+			continue
+		fi
+		### one line per pid+fd+path in the switched file: a container handle keeps its own
+		### path after the switch and a pool handle never changes, so without the ledger gdb
+		### would be attached and the log filled again on every cron run
+		if grep -qxF "$(printf '%s\t%s\t%s' "$process_id" "$file_descr" "$openpath")" "$pc_switched" 2> /dev/null; then
+			continue
+		fi
+		### a handle that is already on the pool has nothing to gain, said once
+		case "$openpath" in
+			"/mnt/$cache_pool"/*)
+				printf '%s\t%s\t%s\n' "$process_id" "$file_descr" "$openpath" >> "$pc_switched"
+				echo "handle already on cache: $(basename "$openpath")"
+				continue
+				;;
+		esac
+		### a container process renders its fds from its own side, map the path back to the host before matching
+		hostpath=$(apply_rewrite "$openpath")
+		if [ -z "$hostpath" ] || ! is_cached_file "$hostpath"; then
+			continue
+		fi
+		### never hand a process a truncated copy, the pool path is built share relative,
+		### the host path may be a /mnt/user view that shares nothing with the array source path
+		cache_copy="/mnt/$cache_pool/$(pc_rel "$hostpath")"
+		if [ ! -f "$cache_copy" ] || [ "$(stat --printf "%s" "$cache_copy" 2> /dev/null)" != "$(stat --printf "%s" "$hostpath" 2> /dev/null)" ]; then
+			continue
+		fi
+		### inside the process only a path it can see works: host handles go straight to the pool copy,
+		### container handles are reopened through their own mount, shfs resolves those to the pool
+		case "$openpath" in
+			/mnt/*)	switch_to="$cache_copy" ;;
+			*)		switch_to="$openpath" ;;
+		esac
+		switch_esc=$(printf '%s' "$switch_to" | sed 's/\\/\\\\/g; s/"/\\"/g')
+		### move the handle to the cache copy, playback continues on the pool and the array can spin down
+		### a fresh open starts at offset 0, the read position has to be carried over or a sequential
+		### reader jumps back to the start of the file, O_RDONLY only, never create
+		printf 'set $pc_pos = (long)lseek(%s, 0, 1)\nset $pc_new = (int)open("%s", 0)\nif $pc_new >= 0\n  if $pc_pos >= 0\n    call (long)lseek($pc_new, $pc_pos, 0)\n  end\n  set $pc_dup = (int)dup2($pc_new, %s)\n  call (int)close($pc_new)\n  if $pc_dup == %s\n    printf "PCSWITCH=ok\\n"\n  else\n    printf "PCSWITCH=dupfail\\n"\n  end\nelse\n  printf "PCSWITCH=fail\\n"\nend\n' \
+			"$file_descr" "$switch_esc" "$file_descr" "$file_descr" > "$gdb_cmds"
+		### -batch detaches when the script ends and never waits on stdin, the timeout
+		### unfreezes the media process for good if gdb ever hangs while attached
+		### the exe file and the sysroot are named explicitly: the process can be a container
+		### binary whose exe and libraries are not under the host /, and debuginfod must not
+		### try to pull symbols from the network
+		gdb_out=$(timeout 20 gdb -q -nx -batch \
+			-iex "set debuginfod enabled off" \
+			-iex "set sysroot /proc/$process_id/root" \
+			"/proc/$process_id/exe" -p "$process_id" -x "$gdb_cmds" 2>&1)
+		rm "$gdb_cmds" 2> /dev/null
+		### if the timeout killed gdb while it was attached the process can stay stopped
+		### (state T), a resume does nothing to a process that is already running
+		kill -CONT "$process_id" 2> /dev/null
+		### the marker proves open, seek and dup2 worked, for a container handle the path
+		### stays identical and the marker is the only signal, shfs serves the file from
+		### the pool from now on, a host handle can also be verified from the outside
+		if printf '%s' "$gdb_out" | grep -q "PCSWITCH=ok"; then
+			if [ "$switch_to" != "$openpath" ] && [ "$(readlink "/proc/$process_id/fd/$file_descr" 2> /dev/null)" != "$switch_to" ]; then
+				echo "handle changed under us: $(basename "$hostpath")"
+			else
+				printf '%s\t%s\t%s\n' "$process_id" "$file_descr" "$openpath" >> "$pc_switched"
+				echo "handle switched to cache: $(basename "$hostpath")"
+			fi
+		else
+			printf '%s\n' "$gdb_out" > "$tmpdir/gdb_last_fail.txt" 2> /dev/null
+			echo "gdb could not switch $(basename "$hostpath"): $(printf '%s' "$gdb_out" | grep -vE "New LWP|libthread_db|__syscall_cancel_arch|Thread debugging|^\$|Inferior|^\[|0x[0-9a-f]+" | head -n 2 | tr '\n' ' ')"
+		fi
+		done < "$proc_openfiles"
+	return 0
+}
+
+################################
+### shared by both modes, cache the playing item and move the open handles to the copy
+cache_the_item() {
+	local index directory pc_total pc_done
+
+	### break if there is no subfolder match
+	if ! printf '%s' "$openpath" | grep -qE "$media_folders"; then
+		echo "not matching $media_folders, breaking here"
+		return 1
+	fi
+	### break if there is a exclusion match
+	if [ ! -z "$never_cache" ]; then
+		if printf '%s' "$openpath" | grep -qE "$never_cache"; then
+			echo "matching exclusion $never_cache, breaking here"
+			return 1
+		fi
+	fi
+	### pool only media, nothing to copy, restart the keep timer of the folder
+	if [ -z "$diskpath" ]; then
+		echo "$openpath is not on the array, nothing to copy"
+		case "$openpath" in
+			"/mnt/$cache_pool"/*)	with_list_lock stamp_folder "$(dirname "$openpath")" ;;
+		esac
+		return 0
+	fi
+	decide_copy_mode
+	build_copy_list
+	### a cancelled run can leave a folder half copied, so always run rsync, it skips
+	### identical files almost for free
+	if [ -f "$poolpath" ]; then
+		pc_was_cached=1
+		echo "already on the cache, checking the rest: $rsync_target"
+	else
+		pc_was_cached=0
+		echo "caching $rsync_target ($copy_mode)"
+	fi
+	### on the list before the first byte: the mover skips the folder while rsync runs and
+	### cannot pick up rsync's temporary .file.xyz files, the fresh stamp also keeps a
+	### concurrent clean from releasing a folder that is being re-cached right now
+	with_list_lock add_to_list "$rsync_target"
+	pc_total=${#copy_sources[@]}
+	pc_done=0
+	for index in "${!copy_sources[@]}"
+		do
+		if pc_cancelled "cancelled after $pc_done of $pc_total files"; then return 1; fi
+		pc_state run "file $((pc_done+1)) of $pc_total"
+		if [ -f "${copy_sources[$index]}" ]; then
+			mkdir -p "$(dirname "${copy_targets[$index]}")" 2> /dev/null
+		fi
+		if ! pc_rsync "${copy_sources[$index]}" "${copy_targets[$index]}"; then
+			return 1
+		fi
+		pc_done=$((pc_done+1))
+		done
+	if [ "$notifications" = "yes" ] && [ "$pc_was_cached" == "0" ]; then
+		/usr/local/emhttp/webGui/scripts/notify -e "Playback Cache Info" -s "Copy File" -d "$rsync_target/" -i "normal" &
+	fi
+	if [ "$pc_was_cached" == "1" ]; then
+		PC_RESULT="already on the cache: $(basename "$rsync_target")"
+	else
+		PC_RESULT="cached $(basename "$rsync_target")"
+	fi
+	### the handles of the copied files are still on the array, switch or close them, nothing else
+	switch_handles
+	return 0
+}
+
+################################
+### look at what the server says is playing, every item gets its own pass
+if pc_cancelled "cancelled"; then exit 0; fi
+if [ "$mediaserver_host" == "" ] || [ "$mediaserver_port" == "" ] || [ "$mediaserver_key" == "" ]; then
+	echo "ERROR: please fill all fields, type, host, port, key, aborting here"
+	exit 1
+fi
+if [ "$mediaserver_type" == "" ]; then
+	echo "ERROR: no media server type set, aborting here"
+	exit 1
+fi
+playing_list=$(ask_playing)
+rc=$?
+if [ $rc -eq 2 ]; then
+	echo "no usable answer from the media server api on $mediaserver_host:$mediaserver_port, check type, host, port and key"
+	exit 1
+fi
+if [ -z "$playing_list" ]; then
+	echo "nothing playing on $mediaserver_host, breaking here"
+	exit 0
+fi
+### the items have to still be playing after the waiting time, previews and short scrubs should not fill the pool
+### a manual run skips this, the click itself is the confirmation
+first_list="$playing_list"
+if [ "$pc_now" != "1" ] && [ "${wait_minutes:-0}" -gt 0 ]; then
+	pc_state run "waiting ${wait_minutes} min, the item has to still be playing"
+	### sleep in small steps, a cancel is noticed right away instead of after the whole wait
+	pc_wait=$(( wait_minutes * 60 ))
+	while [ $pc_wait -gt 0 ]
+		do
+		pc_cancelled "cancelled" && exit 0
+		sleep 5
+		pc_wait=$(( pc_wait - 5 ))
+		done
+	### re-ask after the wait and keep only the items that were playing both times,
+	### something started seconds ago is exactly the preview the wait filters out
+	playing_list=$(ask_playing | grep -Fxf <(printf '%s\n' "$first_list"))
+fi
+if [ -z "$playing_list" ]; then
+	echo "nothing playing anymore on $mediaserver_host, breaking here"
+	exit 0
+fi
+while IFS=$'\t' read -r item_type hostpath
+	do
+	[ -z "$hostpath" ] && continue
+	resolve_item "$hostpath" "$item_type" || continue
+	cache_the_item
+	if pc_cancelled "cancelled"; then break; fi
+	done <<< "$(printf '%s\n' "$playing_list" | shuf)"
+
+### blank lines only happen with manual edits
+with_list_lock sed -i '/^[[:space:]]*$/d' "$exclusion_list" 2> /dev/null
+
+exit;

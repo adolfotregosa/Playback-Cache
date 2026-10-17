@@ -1,0 +1,371 @@
+#!/bin/bash
+# Playback Cache - unRAID plugin
+
+################################
+source /boot/config/plugins/playback-cache/playback-cache.cfg
+################################
+
+### cron and webui launches can carry a minimal PATH
+PATH="$PATH:/usr/bin:/usr/local/bin:/bin"
+
+################################
+### "folder <path>" releases one folder right away, the Cached tab DELETE uses it,
+### it waits for a running cron clean instead of walking away
+pc_only=""
+pc_release_now=0
+pc_only_done=0
+if [ "${1:-}" == "folder" ] && [ ! -z "${2:-}" ]; then
+	pc_only="$2"
+	pc_release_now=1
+fi
+### the RUN CLEANER button starts this script with "now", a human is asking right here,
+### the log file then tells the whole story, releasing folders regardless of age stays folder mode
+pc_manual=$pc_release_now
+[ "${1:-}" = "now" ] && pc_manual=1
+
+################################
+### everything is logged to the plugin log file, syslog is an extra when it is on,
+### the redirect comes before the locks so even "still going, later" lands in the log
+pc_logfile="/var/log/playback-cache.log"
+pc_size=$(stat -c %s "$pc_logfile" 2> /dev/null)
+if [ "${pc_size:-0}" -gt 1048576 ]; then
+	### trim in place, cat > keeps the inode the other script may be appending to,
+	### the lock keeps the two scripts from trimming over each other
+	(
+		flock -w 10 7 || exit 0
+		tail -n 2000 "$pc_logfile" > "$pc_logfile.tmp" 2> /dev/null && cat "$pc_logfile.tmp" > "$pc_logfile"
+		rm -f "$pc_logfile.tmp"
+	) 7> /var/run/playback-cache-log.lock
+fi
+### the log file keeps the whole story of a manual release, a cron run only the events,
+### syslog only ever sees what really happened, manual release or not
+pc_syslog="no"
+[ "$log_to_syslog" == "yes" ] && pc_syslog="yes"
+exec > >(while IFS= read -r pc_line; do
+	case "$pc_line" in
+		*"released from the list"*|*"removed "*|*"no stamp yet"*|*"still going"*|*"cancel requested,"*|ERROR:*|WARN:*)	pc_event=1 ;;
+		*)	pc_event=0 ;;
+	esac
+	if [ $pc_manual -eq 0 ] && [ $pc_event -eq 0 ]; then continue; fi
+	printf 'clean: %(%F %T)T %s\n' -1 "$pc_line" >> "$pc_logfile"
+	if [ "$pc_syslog" == "yes" ] && [ $pc_event -eq 1 ]; then logger "playback-cache: clean: ${pc_line}"; fi
+done)
+### bash's own errors get the ERROR: mark, so cron keeps them too
+exec 2> >(while IFS= read -r l; do printf 'ERROR: %s\n' "$l"; done)
+
+################################
+### one run at a time, the lock is taken before anything is written
+exec 9> /var/run/playback-cache-clean.lock
+if [ $pc_release_now -eq 1 ]; then
+	flock -w 120 9 || { echo "a clean run is still going, release this folder later"; exit 1; }
+else
+	flock -n 9 || exit 0
+fi
+
+### never work on folders while a copy run is going, the copy may be filling one of them
+exec 6> /var/run/playback-cache-copy.lock
+flock -w 600 6 || { echo "a copy run is still going, cleaning later"; exit 0; }
+
+### remove leading trailing slashes, the mount check below needs the clean name
+cache_pool="${cache_pool#/}"
+cache_pool="${cache_pool%/}"
+
+################################
+
+### special subfolder keep hours, comma seperated, spaces inside a value are allowed
+case "$keep_long_folders" in
+	*,*)	keep_long_folders=$(echo "$keep_long_folders" | sed 's/ *, */,/g; s/^,//; s/,$//; s/,/|/g') ;;
+	"")	;;
+	*)	[ "$(echo "$keep_long_folders" | wc -w)" -gt 1 ] && echo "WARN: Keep these folders: read as one value, use a comma to separate several values"
+		keep_long_folders=$(echo "$keep_long_folders" | sed 's/^ *//; s/ *$//') ;;
+esac
+
+################################
+### temp files
+tmpdir="/var/run/playback-cache"
+mkdir -p "$tmpdir" 2> /dev/null
+tmp_show_list="$tmpdir/temp_show_list.txt"
+
+################################
+### the working list of cached folders, one file, Mover Tuning points at the same path,
+### the copy job writes it and the cleaner reads it, it is the heart of the plugin
+if [ -z "$exclusion_list" ]; then
+	echo "ERROR: the list file path is empty, set it in the plugin settings"
+	exit 1
+fi
+mkdir -p "$(dirname "$exclusion_list")" 2> /dev/null
+if ! touch "$exclusion_list" 2> /dev/null; then
+	echo "ERROR: cannot write the list file $exclusion_list, check its folder"
+	exit 1
+fi
+chmod 644 "$exclusion_list" 2> /dev/null
+
+################################
+### the list feeds the cleaner's rm and the mover exclusion, every write goes through one
+### lock, a lost line would leave a cached folder untracked and unprotected from the mover
+list_lock="/var/run/playback-cache-list.lock"
+stamps_file="${exclusion_list}.stamps"
+with_list_lock() { # runs the command with the list lock held, fd 8, the run lock owns 9
+	(
+		flock 8
+		"$@"
+	) 8> "$list_lock"
+}
+### the cleaner ages from these stamps, atime is not a clock: relatime bumps it on every
+### library scan, a long keep would never expire
+stamp_folder() { # $1 folder, (re)starts its keep timer
+	[ -z "$exclusion_list" ] && return 0
+	local stamp_tmp
+	stamp_tmp=$(mktemp) 2> /dev/null || return 1
+	{ awk -F '\t' -v f="$1" '$2 != f' "$stamps_file" 2> /dev/null; printf '%s\t%s\n' "$(date +%s)" "$1"; } > "$stamp_tmp" 2> /dev/null && mv "$stamp_tmp" "$stamps_file" 2> /dev/null
+	rm -f "$stamp_tmp" 2> /dev/null
+}
+unstamp_folder() { # $1 folder, forgets its keep timer
+	[ -z "$exclusion_list" ] && return 0
+	[ -f "$stamps_file" ] || return 0
+	local stamp_tmp
+	stamp_tmp=$(mktemp) 2> /dev/null || return 1
+	awk -F '\t' -v f="$1" '$2 != f' "$stamps_file" > "$stamp_tmp" 2> /dev/null && mv "$stamp_tmp" "$stamps_file" 2> /dev/null
+	rm -f "$stamp_tmp" 2> /dev/null
+}
+
+### list settings are comma seperated, spaces inside a value are allowed
+list_to_regex() { # $1 setting value, comma seperated list -> regex
+	case "$1" in
+		*,*)	echo "$1" | sed 's/ *, */,/g; s/,,*/,/g; s/^,//; s/,$//; s/,/|/g; s/^ *//; s/ *$//' ;;
+		*)	echo "$1" | sed 's/^ *//; s/ *$//' ;;
+	esac
+}
+media_folders=$(list_to_regex "$media_folders")
+
+################################
+### status for the webui, written through a temp file so a reader never sees a half line
+pc_state() { # $1 run|end, $2 text
+	printf '%s|%s|%s|%s\n' "$$" "$1" "$(date +%s)" "$2" > "/var/run/playback-cache-clean.state.tmp" 2> /dev/null
+	mv -f "/var/run/playback-cache-clean.state.tmp" "/var/run/playback-cache-clean.state" 2> /dev/null
+}
+PC_RESULT="nothing to remove"
+trap 'pc_state end "$PC_RESULT"' EXIT
+pc_state run "starting"
+### a cancel is only for the run that was going when it was pressed, copy and clean have their own flag
+rm -f /var/run/playback-cache-clean.cancel
+
+### an unmounted pool would make every folder look gone and wipe the whole list, stop before that
+if ! awk -v m="/mnt/$cache_pool" '$2 == m { f = 1 } END { exit !f }' /proc/mounts; then
+	echo "ERROR: /mnt/$cache_pool is not mounted, breaking here"
+	PC_RESULT="pool not mounted"
+	exit 1
+fi
+
+################################
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+
+### remove one folder from the mover exclusion list, exact line match
+remove_from_list() {
+	if [ -z "$1" ] || [ ! -f "$exclusion_list" ]; then
+		return
+	fi
+	(
+		flock 8
+		grep -vxF -- "$1" "$exclusion_list" > "$tmp_show_list" 2> /dev/null
+		### 0 some lines kept, 1 the list ends up empty, everything else is an error
+		if [ $? -le 1 ]; then
+			mv "$tmp_show_list" "$exclusion_list"
+		fi
+	) 8> "$list_lock"
+}
+
+################################
+### check age and move back / delete
+targetdir=""
+relpath=""
+
+### where the original lives: user shares view, array disks, other mounts like ZFS, then unassigned devices,
+### looking a path up can wake a spun down disk, so this runs only for folders that are due
+find_targetdir() { # sets targetdir to the original folder on the array, empty if gone
+	targetdir=""
+	if [ -d "/mnt/user0/$relpath" ]; then
+		targetdir="/mnt/user0/$relpath"
+	fi
+	if [ -z "$targetdir" ]; then
+		targetdir=$(ls -d /mnt/disk*/"$relpath" 2> /dev/null | grep -v "^/mnt/$cache_pool/" | head -n 1)
+		if [ -z "$targetdir" ]; then
+			targetdir=$(ls -d /mnt/disk*/*/"$relpath" 2> /dev/null | grep -v "^/mnt/$cache_pool/" | head -n 1)
+		fi
+		if [ -z "$targetdir" ]; then
+			for src_dir in /mnt/*; do
+				case "${src_dir#/mnt/}" in
+					disk*|user|user0|"$cache_pool")	continue ;;
+				esac
+				if [ -d "$src_dir/$relpath" ]; then
+					targetdir="$src_dir/$relpath"
+					break
+				fi
+			done
+		fi
+		if [ -z "$targetdir" ] && [ -d "/mnt/disks/$relpath" ]; then
+			targetdir="/mnt/disks/$relpath"
+		fi
+	fi
+}
+
+pc_total=$(grep -c . "$exclusion_list" 2> /dev/null); pc_total=${pc_total:-0}
+pc_i=0
+pc_removed=0
+pc_cancel=0
+### read the list line by line as it is, word splitting would glob a name like Movie [imdbid-tt123]
+mapfile -t pc_folders < "$exclusion_list"
+
+for folder in "${pc_folders[@]}"
+	do
+	if [ -z "${folder//[[:space:]]/}" ]; then
+		continue
+	fi
+	### folder mode: every other line is none of our business
+	if [ -n "$pc_only" ] && [ "$folder" != "$pc_only" ]; then
+		continue
+	fi
+	### the list feeds find and rm, only accept our own folder paths, nothing else,
+	### a dotdot could walk out of the pool
+	case "${folder:?}" in
+		*/../*|*/..)
+			echo "list line '$folder' contains '..', removed from the list"
+			remove_from_list "$folder"
+			with_list_lock unstamp_folder "$folder"
+			continue
+			;;
+		"/mnt/$cache_pool"/*/*) ;;
+		*)
+			echo "list line '$folder' is not a folder under /mnt/$cache_pool, removed from the list"
+			remove_from_list "$folder"
+			with_list_lock unstamp_folder "$folder"
+			continue
+			;;
+	esac
+	if ! printf '%s' "$folder" | grep -qE "$media_folders"; then
+		echo "list line '$folder' does not match the Media subfolders, removed from the list"
+		remove_from_list "$folder"
+		with_list_lock unstamp_folder "$folder"
+		continue
+	fi
+	pc_i=$((pc_i+1))
+	if [ "$folder" == "$pc_only" ]; then
+		pc_only_done=1
+	fi
+	### the webui cancel is noticed between folders, the current one is never half done
+	if [ -f /var/run/playback-cache-clean.cancel ]; then
+		rm -f /var/run/playback-cache-clean.cancel
+		echo "cancel requested, stopping here, the folders handled so far are complete"
+		PC_RESULT="cancelled after $((pc_i-1)) of $pc_total folders"
+		pc_cancel=1
+		break
+	fi
+	pc_state run "folder $pc_i of $pc_total"
+	find "$folder/" -type d -empty -delete 2> /dev/null
+	if [ -d "$folder" ]; then
+		### age from the stamp file, atime is not a clock: relatime bumps it on every library
+		### scan and on the find above, a long keep would never expire
+		last_stamp=""
+		if [ -f "$stamps_file" ]; then
+			last_stamp=$(awk -F '\t' -v f="$folder" '$2 == f { s = $1 } END { print s }' "$stamps_file")
+		fi
+		if [ -z "$last_stamp" ]; then
+			if [ $pc_release_now -eq 1 ]; then
+				### a manual release does not wait for a clock that never started
+				last_stamp=$(date +%s)
+			else
+				with_list_lock stamp_folder "$folder"
+				echo "$folder has no stamp yet, the keep timer starts now"
+				continue
+			fi
+		fi
+		last_access=$(( $(date +%s) - last_stamp ))
+		last_access=$(echo "$last_access" | awk '{printf "%d", $1/3600}')
+		keephours=""
+		if [ ! -z "$keep_long_folders" ] && [[ "$folder" =~ ($keep_long_folders)/ ]]; then
+			keephours=$keep_hours_long
+		else
+			keephours=$keep_hours
+		fi
+		### an empty keep value must never stop the release silently
+		keephours="${keephours:-24}"
+		### path text only from here on, deciding from the stamps alone must not touch any disk
+		relpath=$(echo "${folder/"/mnt/$cache_pool"/}")
+		if [ $pc_release_now -eq 1 ] || { [ -n "$keephours" ] && [ -n "$last_access" ] && [ "$last_access" -gt "$keephours" ]; }; then
+			### only a folder that is due touches the array, everything else is decided from the stamps alone
+			find_targetdir
+			### per file, not all or nothing: new files can land in a cached folder (the pool is the share
+			### primary), they must not pin the folder on the list forever, drop the verified duplicates,
+			### keep everything else and release the folder, the mover handles what stays
+			if [ -z "$targetdir" ] || [ ! -d "$targetdir" ]; then
+				echo "$folder untouched for $last_access hours but its original folder is not found anymore, removed from the list, mover may move the cache copy back"
+				if [ "$notifications" = "yes" ]; then
+					/usr/local/emhttp/webGui/scripts/notify -e "Playback Cache Info" -s "Check Note" -d "$folder/" -i "warning" &
+				fi
+			else
+				pc_rm_n=0
+				pc_stale=""
+				while IFS= read -r -d '' cache_file
+					do
+					array_file="$targetdir/${cache_file#"$folder"/}"
+					if [ ! -f "$array_file" ]; then
+						### only on the pool, a newer download, the mover picks it up once the folder is released
+						echo "keeping $cache_file, not on the array yet, the mover handles it"
+					elif [ "$(stat --printf "%s %Y" "$cache_file" 2> /dev/null)" == "$(stat --printf "%s %Y" "$array_file" 2> /dev/null)" ]; then
+						### identical twin, size and time, rsync -a keeps both, no recycle here:
+						### the array holds the same file, a pool copy of it is only wasted space
+						if rm -f -- "$cache_file" 2> /dev/null; then
+							pc_rm_n=$((pc_rm_n+1))
+						fi
+					else
+						### same name, different file, an upgrade written through the pool, mover skips files
+						### that already exist on the array so this pair needs eyes on it
+						pc_stale="$cache_file"
+						echo "WARN: keeping $cache_file, a different version exists on the array, mover skips files that exist there, check this pair"
+					fi
+					done < <(find "$folder/" -type f -print0 2> /dev/null)
+				if [ $pc_rm_n -gt 0 ]; then
+					echo "removed $pc_rm_n verified copies from $folder"
+					if [ "$notifications" = "yes" ]; then
+						/usr/local/emhttp/webGui/scripts/notify -e "Playback Cache Info" -s "Remove Note" -d "$folder/" -i "normal" &
+					fi
+				fi
+				if [ -n "$pc_stale" ]; then
+					if [ "$notifications" = "yes" ]; then
+						/usr/local/emhttp/webGui/scripts/notify -e "Playback Cache Info" -s "Check Note" -d "$pc_stale" -i "warning" &
+					fi
+				fi
+				find "$folder/" -depth -type d -empty -delete 2> /dev/null
+				### remove the parents this release emptied, one level at a time, rmdir refuses a
+				### folder that still holds anything, the share's top folder on the pool always stays
+				up=$(dirname "$folder")
+				while [ "$(dirname "$up")" != "/mnt/$cache_pool" ] && [ "$up" != "/mnt/$cache_pool" ]
+					do
+					rmdir "$up" 2> /dev/null || break
+					up=$(dirname "$up")
+					done
+			fi
+			echo "$folder released from the list"
+			remove_from_list "$folder"
+			with_list_lock unstamp_folder "$folder"
+			pc_removed=$((pc_removed+1))
+		else
+			echo "$folder untouched for $last_access hours, keep hours is $keephours"
+		fi
+	else
+		echo "$folder is not on $cache_pool anymore, removed from the list"
+		remove_from_list "$folder"
+		with_list_lock unstamp_folder "$folder"
+	fi
+	done
+
+if [ $pc_release_now -eq 1 ] && [ $pc_only_done -eq 0 ]; then
+	echo "$pc_only is not in the list, nothing was released"
+	PC_RESULT="not in the list"
+elif [ $pc_cancel -eq 0 ]; then
+	if [ $pc_removed -eq 0 ]; then PC_RESULT="nothing to remove"; else PC_RESULT="released $pc_removed of $pc_total folders"; fi
+fi
+
+### blank lines only happen with manual edits
+with_list_lock sed -i '/^[[:space:]]*$/d' "$exclusion_list" 2> /dev/null

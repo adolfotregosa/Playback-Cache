@@ -1,0 +1,145 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "playback-cache">
+<!ENTITY author    "Adolfo Rodrigues">
+<!ENTITY version   "2026.10.17">
+<!ENTITY launch    "Utilities/playback-cache">
+<!ENTITY plgdir    "/boot/config/plugins/&name;">
+<!ENTITY pkg       "&name;-&version;-x86_64-1.txz">
+<!ENTITY gdbpkg    "gdb-15.2-x86_64-3.txz">
+<!ENTITY py3pkg    "python3-3.12.8-x86_64-1.txz">
+<!ENTITY support   "https://github.com/adolfotregosa/Playback-Cache">
+<!ENTITY gitURL    "https://raw.githubusercontent.com/adolfotregosa/Playback-Cache/main">
+<!ENTITY pluginURL "&gitURL;/&name;.plg">
+<!ENTITY dl        "&gitURL;/packages">
+]>
+<!--
+  Playback Cache for Unraid
+-->
+<PLUGIN name="&name;"
+        author="&author;"
+        version="&version;"
+        launch="&launch;"
+        icon="playback-cache.png"
+        pluginURL="&pluginURL;"
+        support="&support;"
+        min="7.0.0">
+
+<CHANGES>
+###2026.10.16
+- First Release
+###2026.10.17
+- Clean runs decide from the stamps alone, the array is only looked at for folders that are actually released, so a scheduled clean never wakes spun down disks
+</CHANGES>
+
+<!-- python3 and gdb are requirements of the handle switching (gdb links against
+     libpython3.12 and will not start without python3), both are downloaded from
+     the repository when missing, a package already placed in the plugin folder
+     by hand is used as it is -->
+
+<FILE Name="/usr/local/emhttp/plugins/&name;/README.md">
+<INLINE>
+**Playback Cache**
+
+Copies playing media from the array to a cache pool so the array disks can spin down during playback.
+</INLINE>
+</FILE>
+
+<!-- python3: skip when it already works, when dwpython provides it or when the user
+     put one in /boot/extra, an existing python3 is never replaced -->
+<FILE Name="&plgdir;/&py3pkg;">
+<URL>&dl;/&py3pkg;</URL>
+</FILE>
+<FILE Run="/bin/bash">
+<INLINE>
+export PATH="$PATH:/usr/bin:/usr/local/bin:/bin:/usr/sbin:/usr/local/sbin"
+if type python3 > /dev/null 2>&amp;1 || [ -e /boot/config/plugins/dwpython.plg ] || compgen -G "/boot/extra/python3-*" > /dev/null 2>&amp;1; then
+	echo "python3 is already provided, nothing installed"
+else
+	upgradepkg --install-new &plgdir;/&py3pkg;
+fi
+</INLINE>
+</FILE>
+
+<!-- gdb: the plugin manager runs upgradepkg at install and again at every boot,
+     the crontab and the packages live in RAM and are gone after a reboot -->
+<FILE Name="&plgdir;/&gdbpkg;" Run="upgradepkg --install-new">
+<URL>&dl;/&gdbpkg;</URL>
+</FILE>
+
+<!-- say out loud when gdb still cannot run, the settings page shows the same check -->
+<FILE Run="/bin/bash">
+<INLINE>
+export PATH="$PATH:/usr/bin:/usr/local/bin:/bin:/usr/sbin:/usr/local/sbin"
+if ! gdb --version > /dev/null 2>&amp;1; then
+	echo "WARN: gdb cannot run on this system yet:"
+	gdb --version 2>&amp;1 | head -n 1 | sed 's/^/      /'
+fi
+</INLINE>
+</FILE>
+
+<!-- Main plugin package -->
+<FILE Name="&plgdir;/&pkg;" Run="upgradepkg --install-new">
+<URL>&dl;/&pkg;</URL>
+</FILE>
+
+<!-- Post-install -->
+<FILE Run="/bin/bash">
+<INLINE>
+# Remove packages of older versions left in the plugin folder
+find &plgdir; -maxdepth 1 -name "&name;-*.txz" ! -name "&pkg;" -delete 2>/dev/null
+echo ""
+echo "----------------------------------------------------"
+echo " &name; &version; has been installed."
+echo "----------------------------------------------------"
+echo ""
+</INLINE>
+</FILE>
+
+<!-- one-time rename of the settings keys, an existing setup keeps working after the upgrade -->
+<FILE Run="/bin/bash">
+<INLINE>
+if [ -f &plgdir;/&name;.cfg ] &amp;&amp; grep -q "^move_excl_list=" &plgdir;/&name;.cfg; then
+	sed -i -e 's/^pool=/cache_pool=/' -e 's/^subfolders=/media_folders=/' -e 's/^wait_todo=/wait_minutes=/' -e 's/^move_excl_list=/exclusion_list=/' -e 's/^rsync_mode=/copy_scope=/' -e 's/^rsync_copy=/rsync_command=/' -e 's/^time_keephours_sub=/keep_hours_long=/' -e 's/^time_keephours=/keep_hours=/' -e 's/^subfolder_keep_sub=/keep_long_folders=/' -e 's/^unraid_note=/notifications=/' -e 's/^unraid_syslog=/log_to_syslog=/' -e 's/^script_cron_state=/copy_cron_state=/' -e 's/^script_cron=/copy_cron=/' -e 's/^rewrite_source=/path_mappings=/' -e 's/^exclusions=/never_cache=/' &plgdir;/&name;.cfg
+	echo "settings keys renamed to the new names"
+fi
+</INLINE>
+</FILE>
+
+<!-- a fresh install starts from the shipped defaults, an existing setup is never touched -->
+<FILE Run="/bin/bash">
+<INLINE>
+if [ ! -f &plgdir;/&name;.cfg ]; then
+	mkdir -p &plgdir;
+	cp /usr/local/emhttp/plugins/&name;/default.cfg &plgdir;/&name;.cfg
+	echo "default settings created"
+fi
+</INLINE>
+</FILE>
+
+<!-- root's crontab is rebuilt at every boot, put our schedules back from the saved settings -->
+<FILE Run="/bin/bash">
+<INLINE>
+if [ -f &plgdir;/&name;.cfg ]; then
+	/usr/local/emhttp/plugins/&name;/scripts/cache_crons.sh
+fi
+</INLINE>
+</FILE>
+
+<!-- Uninstall -->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+removepkg &name;-&version;-x86_64-1 2>/dev/null
+rm -rf /usr/local/emhttp/plugins/&name;
+# drop our crontab lines
+crontab -l 2> /dev/null | grep -vE "playback-cache/scripts/playback_cache" | crontab - 2>/dev/null
+# gdb and python3 are left installed on purpose, other tools may use them.
+rm -f /var/log/playback-cache.log
+rm -rf /var/run/playback-cache /var/run/playback-cache-*
+# This also deletes your settings and the local txz files:
+rm -rf &plgdir;
+echo "&name; has been removed."
+</INLINE>
+</FILE>
+
+</PLUGIN>

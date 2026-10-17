@@ -1,0 +1,6 @@
+# local only
+local_backup/
+
+# never publish settings, they hold media server API keys
+*.cfg
+!default.cfg
