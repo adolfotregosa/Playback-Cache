@@ -364,7 +364,12 @@ if [ $pc_release_now -eq 1 ] && [ $pc_only_done -eq 0 ]; then
 	echo "$pc_only is not in the list, nothing was released"
 	PC_RESULT="not in the list"
 elif [ $pc_cancel -eq 0 ]; then
-	if [ $pc_removed -eq 0 ]; then PC_RESULT="nothing to remove"; else PC_RESULT="released $pc_removed of $pc_total folders"; fi
+	if [ $pc_removed -eq 0 ]; then
+		PC_RESULT="nothing to remove"
+	else
+		PC_RESULT="released $pc_removed folder$( [ "$pc_removed" -gt 1 ] && echo s )"
+		[ $(( pc_total - pc_removed )) -gt 0 ] && PC_RESULT="$PC_RESULT, kept $(( pc_total - pc_removed ))"
+	fi
 fi
 
 ### blank lines only happen with manual edits

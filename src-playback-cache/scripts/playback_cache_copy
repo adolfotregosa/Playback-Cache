@@ -37,7 +37,7 @@ pc_syslog="no"
 [ "$log_to_syslog" == "yes" ] && pc_syslog="yes"
 exec > >(while IFS= read -r pc_line; do
 	case "$pc_line" in
-		"caching "*|*"switched to cache:"*|*"already on cache:"*|*"changed under us:"*|gdb\ *|"rsync failed:"*|ERROR:*|WARN:*|"cancel requested,"*|"no usable answer"*)	pc_event=1 ;;
+		"caching "*|*"switched to cache:"*|*"already on the cache"*|*"changed under us:"*|gdb\ *|"rsync failed:"*|ERROR:*|WARN:*|"cancel requested,"*|"no usable answer"*)	pc_event=1 ;;
 		*)	pc_event=0 ;;
 	esac
 	if [ $pc_now -eq 0 ] && [ $pc_event -eq 0 ]; then continue; fi
@@ -620,18 +620,28 @@ fi
 ### a manual run skips this, the click itself is the confirmation
 first_list="$playing_list"
 if [ "$pc_now" != "1" ] && [ "${wait_minutes:-0}" -gt 0 ]; then
-	pc_state run "waiting ${wait_minutes} min, the item has to still be playing"
-	### sleep in small steps, a cancel is noticed right away instead of after the whole wait
-	pc_wait=$(( wait_minutes * 60 ))
-	while [ $pc_wait -gt 0 ]
+	### the wait protects the pool from previews and short scrubs, an item that is already
+	### on the cache cannot fill the pool, such a run goes straight through
+	pc_all_cached=1
+	while IFS=$'\t' read -r item_type hostpath
 		do
-		pc_cancelled "cancelled" && exit 0
-		sleep 5
-		pc_wait=$(( pc_wait - 5 ))
-		done
-	### re-ask after the wait and keep only the items that were playing both times,
-	### something started seconds ago is exactly the preview the wait filters out
-	playing_list=$(ask_playing | grep -Fxf <(printf '%s\n' "$first_list"))
+		[ -z "$hostpath" ] && continue
+		if resolve_item "$hostpath" > /dev/null && [ -n "$diskpath" ] && [ ! -f "$poolpath" ]; then pc_all_cached=0; break; fi
+		done <<< "$first_list"
+	if [ $pc_all_cached -eq 0 ]; then
+		pc_state run "waiting ${wait_minutes} min, the item has to still be playing"
+		### sleep in small steps, a cancel is noticed right away instead of after the whole wait
+		pc_wait=$(( wait_minutes * 60 ))
+		while [ $pc_wait -gt 0 ]
+			do
+			pc_cancelled "cancelled" && exit 0
+			sleep 5
+			pc_wait=$(( pc_wait - 5 ))
+			done
+		### re-ask after the wait and keep only the items that were playing both times,
+		### something started seconds ago is exactly the preview the wait filters out
+		playing_list=$(ask_playing | grep -Fxf <(printf '%s\n' "$first_list"))
+	fi
 fi
 if [ -z "$playing_list" ]; then
 	echo "nothing playing anymore on $mediaserver_host, breaking here"

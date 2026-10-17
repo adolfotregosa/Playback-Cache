@@ -120,7 +120,7 @@ foreach (explode("\n", (string)shell_exec("crontab -l 2> /dev/null")) as $cron_l
         return m ? " (" + Math.floor(m[1]*100/m[2]) + "%)" : "";
     }
     function pcUpdate(s) {
-        var out = [], job, j, checking = false, copying = false, waiting = "";
+        var seg = { copy: "", clean: "" }, note = { copy: "", clean: "" }, job, j, copying = false, parts = [];
         pcRunning = []; pcCopying = [];
         for (var i = 0; i < 2; i++) {
             job = i == 0 ? "copy" : "clean";
@@ -131,16 +131,24 @@ foreach (explode("\n", (string)shell_exec("crontab -l 2> /dev/null")) as $cron_l
                 if (/^(file|folder) [0-9]+ of [0-9]+$/.test(j.text)) {
                     copying = true;
                     pcCopying.push(job);
-                    out.push((job == "copy" ? "Copying" : "Cleaning") + " - " + j.text + pcPct(j.text));
+                    seg[job] = (job == "copy" ? "Copying" : "Cleaning") + " - " + j.text + pcPct(j.text);
                 }
-                else if (!waiting && /^waiting /.test(j.text)) { waiting = j.text; }
-                else { checking = true; }
+                else if (!note[job]) { note[job] = /^waiting /.test(j.text) ? j.text : "checking"; }
             }
-            else if (j.end) { out.push("Last " + job + ": " + pcFmt(j.since) + " - " + j.text); }
+            else if (j.end) { seg[job] = "Last " + job + ": " + pcFmt(j.since) + " - " + j.text; }
         }
+        // an extra belongs to the job that causes it, it must never drift to the end of
+        // the strip and read like a message of the other job
+        if (!copying) {
+            for (var k = 0; k < 2; k++) {
+                job = k == 0 ? "copy" : "clean";
+                if (note[job]) { seg[job] = (seg[job] ? seg[job] + "   ·   " : (job == "copy" ? "Copy" : "Clean") + "   ·   ") + note[job]; }
+            }
+        }
+        if (seg.copy) { parts.push(seg.copy); }
+        if (seg.clean) { parts.push(seg.clean); }
         // the pipe keeps copy and clean apart, the dot stays for the trailing extras
-        var txt = out.length ? out.join("   |   ") : "Nothing to copy";
-        if (!copying) { if (waiting) { txt += "   ·   " + waiting; } else if (checking) { txt += "   ·   checking"; } }
+        var txt = parts.length ? parts.join("   |   ") : "Nothing to copy";
         document.getElementById("pc_status").textContent = txt;
         // poll fast while something runs, lazy when idle
         var wantFast = pcRunning.length > 0;
@@ -432,8 +440,8 @@ List filepath:
 syslog:
 : <?=sel("log_to_syslog", $pcsettings_log_to_syslog == "yes" ? "yes" : "no", array("yes" => "yes", "no" => "no"));?>
 <blockquote class='inline_help'>
-        <p>"yes" also logs to syslog, so the lines show up in the unRAID system log.</p>
-        <p>The plugin always writes its own log file, the Log tab reads that one.</p>
+        <p>"yes" also sends the event lines to syslog, so they show up in the unRAID system log: real work like files cached and handles switched, plus errors and warnings. A scheduled run that does nothing logs nothing.</p>
+        <p>The plugin always writes its own log file, the Log tab reads that one. Manual runs tell the whole story there, syslog only ever sees the events.</p>
 </blockquote>
 
 Unraid Notifications:
