@@ -16,6 +16,7 @@ $pcsettings_wait_minutes        = isset($pcsettings['wait_minutes']) ? $pcsettin
 if ($pcsettings_wait_minutes > 59) { $pcsettings_wait_minutes = intval(round($pcsettings_wait_minutes / 60)); }
 // legacy values like "copy" or "file" all mean Files in use, only "folder" is a real choice
 $pcsettings_copy_scope        = (isset($pcsettings['copy_scope']) && $pcsettings['copy_scope'] == "folder") ? "folder" : "";
+$pcsettings_skip_earlier_episodes        = isset($pcsettings['skip_earlier_episodes']) ? $pcsettings['skip_earlier_episodes'] : "";
 // cache keepalive
 $pcsettings_keep_hours        = isset($pcsettings['keep_hours']) ? $pcsettings['keep_hours'] : "";
 $pcsettings_keep_hours_long        = isset($pcsettings['keep_hours_long']) ? $pcsettings['keep_hours_long'] : "";
@@ -352,6 +353,13 @@ Cache Copy Mode:
         <p><b>Files in use:</b> for a movie, the playing file plus the subtitles and nfo next to it, nothing from subfolders. For a series episode, the whole season folder, subfolders included, because the next episode is the likely next click.</p>
         <p><b>Always the whole folder:</b> everything in the playing file's folder, subfolders included, for movies and series alike.</p>
         <p>"Never cache these" only stops caching when the playing file itself is inside such a folder. Subfolders with those names are still copied whenever a whole folder is copied.</p>
+</blockquote>
+
+Skip earlier episodes:
+: <?=sel("skip_earlier_episodes", $pcsettings_skip_earlier_episodes == "on" ? "on" : "off", array("off" => "Off", "on" => "On"));?>
+<blockquote class='inline_help'>
+        <p><b>On:</b> When an episode plays, only that episode and the episodes after it in the season folder are copied, in file name order, plus all subtitles, nfo and artwork. Earlier episodes stay on the array. Jumping back to an earlier episode caches from there on at the next copy run.</p>
+        <p><b>Off:</b> The whole season folder is copied, subfolders included.</p>
 </blockquote>
 
 Open file handles:

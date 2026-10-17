@@ -411,6 +411,29 @@ decide_copy_mode() {
 	fi
 }
 
+### the episode folder copy that starts at the playing file: no guessing about names,
+### plain version sort on the file names, every non-video file comes along (subtitles,
+### nfo, artwork, also from subfolders), videos only from the folder level and only
+### the playing one and the ones after it, extras and trailers in subfolders stay
+build_skip_list() {
+	local rel playing
+	playing="${diskpath#"$rsync_source"/}"
+	while IFS= read -r rel
+		do
+		[ -z "$rel" ] && continue
+		if printf '%s' "${rel##*/}" | grep -qiE "$video_regex"; then
+			case "$rel" in
+				*/*)	continue ;;
+			esac
+			if [ "$rel" != "$playing" ] && [ "$(printf '%s\n%s\n' "$rel" "$playing" | sort -V | head -n 1)" == "$rel" ]; then
+				continue
+			fi
+		fi
+		copy_sources+=( "$rsync_source/$rel" )
+		copy_targets+=( "$rsync_target/$rel" )
+		done < <(find "$rsync_source" -type f -printf '%P\n' 2> /dev/null)
+}
+
 ### the array files that belong to the playing item and where they land on the pool
 build_copy_list() {
 	local sidecar
@@ -418,8 +441,12 @@ build_copy_list() {
 	copy_sources=()
 	copy_targets=()
 	if [ "$copy_mode" == "folder" ]; then
-		copy_sources+=( "$rsync_source/" )
-		copy_targets+=( "$rsync_target/" )
+		if [ "$skip_earlier_episodes" == "on" ] && [ "$item_type" == "Episode" ]; then
+			build_skip_list
+		else
+			copy_sources+=( "$rsync_source/" )
+			copy_targets+=( "$rsync_target/" )
+		fi
 	else
 		copy_sources+=( "$diskpath" )
 		copy_targets+=( "$poolpath" )

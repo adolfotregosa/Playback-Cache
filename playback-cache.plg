@@ -2,10 +2,10 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "playback-cache">
 <!ENTITY author    "Adolfo Rodrigues">
-<!ENTITY version   "2026.10.17">
+<!ENTITY version   "2026.10.18">
 <!ENTITY launch    "Utilities/playback-cache">
 <!ENTITY plgdir    "/boot/config/plugins/&name;">
-<!ENTITY pkg       "&name;-&version;-x86_64-2.txz">
+<!ENTITY pkg       "&name;-&version;-x86_64-1.txz">
 <!ENTITY gdbpkg    "gdb-15.2-x86_64-3.txz">
 <!ENTITY py3pkg    "python3-3.12.8-x86_64-1.txz">
 <!ENTITY support   "https://github.com/adolfotregosa/Playback-Cache">
@@ -30,6 +30,8 @@
 - First Release
 ###2026.10.17
 - Clean runs decide from the stamps alone, the array is only looked at for folders that are actually released, so a scheduled clean never wakes spun down disks
+###2026.10.18
+- Add skip earlier episodes option
 </CHANGES>
 
 <!-- python3 and gdb are requirements of the handle switching (gdb links against
