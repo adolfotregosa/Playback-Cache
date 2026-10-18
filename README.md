@@ -5,7 +5,7 @@ unRAID plugin that keeps media on a cache pool while it plays, so the array disk
 ## What it does
 
 - Watches what your media server (**Jellyfin**, **Emby** or **Plex**) is playing through its API.
-- Copies the playing file or folder from the array onto your cache pool.
+- Copies the playing file or folder from the array onto your cache pool with option to skip previous episodes.
 - Switches the media server's open file handles to the cache copy while playback continues, so the array disks can finally spin down.
 - Keeps cached folders on the mover exclusion list, so the mover does not undo the work. Requires CA Mover Tuning. 
 - A scheduled cleaner releases folders that have been idle long enough: files with an identical copy on the array are removed from the cache, everything else stays for the mover.
