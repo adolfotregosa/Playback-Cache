@@ -452,10 +452,11 @@ syslog:
         <p>The plugin always writes its own log file, the Log tab reads that one. Manual runs tell the whole story there, syslog only ever sees the events.</p>
 </blockquote>
 
-Unraid Notifications:
+unRaid notifications:
 : <?=sel("notifications", $pcsettings_notifications == "yes" ? "yes" : "no", array("no" => "no", "yes" => "yes"));?>
 <blockquote class='inline_help'>
-        <p>"yes" sends an Unraid notification on copy, removal and when a cache copy is not complete on the array.</p>
+        <p>"yes" sends an Unraid notification when media is copied to the pool, and when a release removes cached copies.</p>
+        <p>It also warns when a release keeps a file because it changed after it was copied: the pool and the array then hold different versions, check that pair. Errors are not notified, they are in the Log tab and, with syslog on, in the system log.</p>
 </blockquote>
 
 rsync copy command:
