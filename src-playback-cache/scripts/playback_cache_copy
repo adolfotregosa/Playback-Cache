@@ -219,6 +219,21 @@ note_copies() { # $1 array source, $2 its pool target, after a good rsync, calle
 	fi
 	rm -f "$tmp" "$tmp.new" 2> /dev/null
 }
+match_parent_dirs() { # $1 pool target, $2 array source: the pool folders above a copy get the
+	# owner and mode of the same folders on the array, never root's, so the containers
+	# (nobody:users) can still write new files there, stops at the pool
+	local p a
+	p=$(dirname "${1%/}")
+	a=$(dirname "${2%/}")
+	while [ "$p" != "/mnt/$cache_pool" ] && [ "$p" != "/" ] && [ -d "$a" ] && [ -d "$p" ]
+		do
+		chown --reference="$a" "$p" 2> /dev/null
+		chmod --reference="$a" "$p" 2> /dev/null
+		p=$(dirname "$p")
+		a=$(dirname "$a")
+		done
+}
+
 add_to_list() { # $1 folder, list line plus fresh stamp, called under the lock
 	printf '%s\n' "$1" >> "$exclusion_list" 2> /dev/null
 	awk -i inplace '!seen[$0]++' "$exclusion_list" 2> /dev/null
@@ -675,6 +690,7 @@ cache_the_item() {
 			return 1
 		fi
 		with_list_lock note_copies "${copy_sources[$index]}" "${copy_targets[$index]}"
+		match_parent_dirs "${copy_targets[$index]}" "${copy_sources[$index]}"
 		pc_done=$((pc_done+1))
 		done
 	if [ "$notifications" = "yes" ] && [ "$pc_was_cached" == "0" ]; then
