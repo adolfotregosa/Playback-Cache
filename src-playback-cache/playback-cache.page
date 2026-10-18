@@ -335,7 +335,7 @@ Media subfolders:
 Never cache these:
 : <input type="text" name="never_cache" maxlength="99" style="width:100%;" value="<?=htmlspecialchars($pcsettings_never_cache, ENT_QUOTES);?>" placeholder="Trailers,Extras" >
 <blockquote class='inline_help'>
-        <p>Optional. Folder names that are never cached even below a Media subfolder, comma separated.</p>
+        <p>Folder names that are never cached, comma separated. A playing file inside such a folder is not cached, and folders with these names are left out when a whole folder is copied.</p>
         <p>Example: "Trailers,Extras".</p>
 </blockquote>
 
@@ -350,9 +350,9 @@ Target pool:
 Cache Copy Mode:
 : <?=sel("copy_scope", $pcsettings_copy_scope, array("" => "Files in use", "folder" => "Always the whole folder"), ' id="copy_scope" onchange="showCopyHint()"');?> <span id="copy_hint" style="display:block;margin-top:2px;"></span>
 <blockquote class='inline_help'>
-        <p><b>Files in use:</b> for a movie, the playing file plus the subtitles and nfo next to it, nothing from subfolders. For a series episode, the whole season folder, subfolders included, because the next episode is the likely next click.</p>
+        <p><b>Files in use:</b> for a movie, the playing file plus the subtitles and nfo next to it, nothing from subfolders. For a series episode, the season folder, as set under "Skip earlier episodes".</p>
         <p><b>Always the whole folder:</b> everything in the playing file's folder, subfolders included, for movies and series alike.</p>
-        <p>"Never cache these" only stops caching when the playing file itself is inside such a folder. Subfolders with those names are still copied whenever a whole folder is copied.</p>
+        <p>Folders listed under "Never cache these" are always left out, in both modes.</p>
 </blockquote>
 
 Skip earlier episodes:

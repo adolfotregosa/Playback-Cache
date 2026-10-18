@@ -66,7 +66,25 @@ list_warn "Media subfolders" "$media_folders"
 list_warn "Never cache these" "$never_cache"
 
 media_folders=$(list_to_regex "$media_folders")
+### the names as typed, for rsync's excludes and the per-file lists, the regex below
+### only checks the playing file
+rsync_excl=()
+never_names=()
+IFS=',' read -r -a pc_ex <<< "$never_cache"
+for n in "${pc_ex[@]}"; do
+	n="${n#"${n%%[![:space:]]*}"}"; n="${n%"${n##*[![:space:]]}"}"
+	[ -n "$n" ] && { never_names+=( "$n" ); rsync_excl+=( "--exclude=$n/" ); }
+done
+in_never_dir() { # $1 path relative to the copied folder, true when a folder in it is a never-cache name
+	local n
+	for n in "${never_names[@]}"; do
+		case "/$1" in */"$n"/*) return 0 ;; esac
+	done
+	return 1
+}
 never_cache=$(list_to_regex "$never_cache")
+### whole folder names only, like the copy excludes: "Extras" must not match "The Extras (2005)"
+[ -n "$never_cache" ] && never_cache="(^|/)($never_cache)/"
 
 ### the subfolder filter is required, an empty regex would match every file
 if [ -z "$media_folders" ]; then
@@ -121,7 +139,7 @@ pc_cancelled() { # $1 result text, the webui asked to stop, checked between file
 ### rsync 3.4 prints a whole stats block per call, only failures are worth a syslog line
 pc_rsync() { # $1 source, $2 target
 	local out rc
-	out=$($rsync_command --quiet "$1" "$2" 2>&1); rc=$?
+	out=$($rsync_command --quiet "${rsync_excl[@]}" "$1" "$2" 2>&1); rc=$?
 	if [ $rc -ne 0 ]; then
 		echo "rsync failed: $(printf '%s' "$out" | head -n 2 | tr '\n' ' ')"
 		PC_RESULT="copy failed"
@@ -421,6 +439,7 @@ build_skip_list() {
 	while IFS= read -r rel
 		do
 		[ -z "$rel" ] && continue
+		in_never_dir "$rel" && continue ### never-cache folders stay out of this list too, their subtitles and nfo included
 		if printf '%s' "${rel##*/}" | grep -qiE "$video_regex"; then
 			case "$rel" in
 				*/*)	continue ;;
@@ -604,7 +623,7 @@ cache_the_item() {
 	### break if there is a exclusion match
 	if [ ! -z "$never_cache" ]; then
 		if printf '%s' "$openpath" | grep -qE "$never_cache"; then
-			echo "matching exclusion $never_cache, breaking here"
+			echo "matching exclusion ${never_names[*]}, breaking here"
 			return 1
 		fi
 	fi
