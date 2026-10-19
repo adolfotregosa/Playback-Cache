@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "playback-cache">
 <!ENTITY author    "Adolfo Rodrigues">
-<!ENTITY version   "2026.10.18b">
+<!ENTITY version   "2026.10.19">
 <!ENTITY launch    "Utilities/playback-cache">
 <!ENTITY plgdir    "/boot/config/plugins/&name;">
 <!ENTITY pkg       "&name;-&version;-x86_64-1.txz">
@@ -36,6 +36,8 @@
 - Copies give their new cache folders the owner and mode of the array folders, so containers keep write access to the cache
 - Never cache these now literally means never cache these.
 - Folders created on the pool now get the same owner and permissions as on the array
+###2026.10.19
+- Minor cosmetic fix on the cached tab.
 </CHANGES>
 
 <!-- python3 and gdb are requirements of the handle switching (gdb links against

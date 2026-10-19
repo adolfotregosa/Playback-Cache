@@ -43,7 +43,7 @@ $list_rows = pc_list_details("/boot/config/plugins/playback-cache/playback-cache
     }
     function pcRelease(h) {
         if (h === null) { return "-"; }
-        return h > 0 ? "in " + pcAge(h) : "now";
+        return h > 0 ? "in " + pcAge(h) : "at next clean";
     }
     var pcListLast = "";
     function pcListRender(folders) {
@@ -103,7 +103,7 @@ $list_rows = pc_list_details("/boot/config/plugins/playback-cache/playback-cache
 <input type="hidden" id="listcommand" name="#command" value="/usr/local/emhttp/plugins/playback-cache/scripts/cache_list_delete.sh" />
 
 <p>Folders currently cached: <span id="pc_list_count"><?=count($list_rows);?></span>, file <code><?=htmlspecialchars($pcsettings_exclusion_list);?></code>.</p>
-<p>Releases the folder: files with an identical copy on the array are removed from the cache, everything else stays for the mover. "Removed in" counts from the last time the folder was played or cached.</p>
+<p>Releases the folder: files with an identical copy on the array are removed from the cache, everything else stays for the mover. "Removed in" counts from the last time the folder was played or cached. A folder is released at the first cleaner run after that time.</p>
 
 <div style='border: 1px solid red; height:auto; max-height:60vh; overflow:auto;'>
 <table>
