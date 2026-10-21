@@ -55,6 +55,10 @@ function cron_friendly($cron) {
         if (strpos($f[0], '*/') === 0) { return "every ".(int)substr($f[0], 2)." minutes"; }
         if (is_numeric($f[0])) { return "every hour at minute ".(int)$f[0]; }
     }
+    if ($f[0] == '0' && $f[2] == '*' && $f[3] == '*' && $f[4] == '*' && ($f[1] == '*' || strpos($f[1], '*/') === 0)) {
+        $n = $f[1] == '*' ? 1 : (int)substr($f[1], 2);
+        return "every ".($n == 1 ? "hour" : $n." hours");
+    }
     if ($f[2] == '*' && $f[3] == '*' && $f[4] == '*' && is_numeric($f[0]) && is_numeric($f[1])) {
         return "every day at ".sprintf("%02d:%02d", $f[1], $f[0]);
     }
@@ -227,7 +231,12 @@ foreach (explode("\n", (string)shell_exec("crontab -l 2> /dev/null")) as $cron_l
             if (n > 59) { n = 59; }
             return "*/" + n + " * * * *";
         }
-        if (kind == "custom") { return document.getElementById(p+"_c").value; }
+        if (kind == "hour") {
+            var hn = parseInt(document.getElementById(p+"_n").value);
+            if (isNaN(hn) || hn < 1) { hn = 12; }
+            if (hn > 23) { hn = 23; }
+            return "0 */" + hn + " * * *";
+        }
         var t = document.getElementById(p+"_t").value;
         if (!/^\d{1,2}:\d{2}$/.test(t)) { t = "00:00"; }
         var h = parseInt(t.split(":")[0]) % 24, m = parseInt(t.split(":")[1]) % 60;
@@ -243,21 +252,16 @@ foreach (explode("\n", (string)shell_exec("crontab -l 2> /dev/null")) as $cron_l
             setN(p, f[0].slice(2)); kind = "min";
         } else if ((cron || "").trim() && p == "copy" && f.join(" ") == "* * * * *") {
             setN(p, "1"); kind = "min";
-        } else if ((cron || "").trim() && p != "copy") {
-            // the cleaner has a custom box, a schedule it cannot show stays visible as one
-            kind = "custom";
-            if (f.length == 5 && f[2] == "*" && f[3] == "*" && f[4] == "*" && /^\d+$/.test(f[0]) && /^\d+$/.test(f[1])) {
-                document.getElementById(p+"_t").value = pad2(f[1])+":"+pad2(f[0]); kind = "day";
-            } else if (f.length == 5 && f[2] == "*" && f[3] == "*" && /^\d$/.test(f[4]) && /^\d+$/.test(f[0]) && /^\d+$/.test(f[1])) {
-                document.getElementById(p+"_t").value = pad2(f[1])+":"+pad2(f[0]);
-                document.getElementById(p+"_d").value = f[4] == 7 ? "0" : f[4]; kind = "week";
-            }
-            if (kind == "custom") { document.getElementById(p+"_c").value = cron; }
-        } else if ((cron || "").trim()) {
-            // a copy schedule the number box cannot show stays visible as custom, APPLY keeps it
-            kind = "custom";
-            document.getElementById(p+"_c").value = cron;
+        } else if ((cron || "").trim() && p != "copy" && f.length == 5 && f[0] == "0" && f[2] == "*" && f[3] == "*" && f[4] == "*" && (f[1] == "*" || /^\*\/\d+$/.test(f[1]))) {
+            setN(p, f[1] == "*" ? "1" : f[1].slice(2)); kind = "hour";
+        } else if ((cron || "").trim() && p != "copy" && f.length == 5 && f[2] == "*" && f[3] == "*" && f[4] == "*" && /^\d+$/.test(f[0]) && /^\d+$/.test(f[1])) {
+            document.getElementById(p+"_t").value = pad2(f[1])+":"+pad2(f[0]); kind = "day";
+        } else if ((cron || "").trim() && p != "copy" && f.length == 5 && f[2] == "*" && f[3] == "*" && /^\d$/.test(f[4]) && /^\d+$/.test(f[0]) && /^\d+$/.test(f[1])) {
+            document.getElementById(p+"_t").value = pad2(f[1])+":"+pad2(f[0]);
+            document.getElementById(p+"_d").value = f[4] == 7 ? "0" : f[4]; kind = "week";
         }
+        // a schedule the boxes cannot show starts at "Not scheduled", the stored cron keeps
+        // running untouched until APPLY ALL rewrites it from the form
         document.getElementById(p+"_kind").value = kind;
         showKind(p);
     }
@@ -284,6 +288,10 @@ foreach (explode("\n", (string)shell_exec("crontab -l 2> /dev/null")) as $cron_l
             if (document.getElementById("copy_kind").value == "min") {
                 var cn = document.getElementById("copy_n").value;
                 if (!/^\d+$/.test(cn) || +cn < 1 || +cn > 59) { alert("Copy schedule: every how many minutes? Use a whole number between 1 and 59"); document.getElementById("copy_n").focus(); return false; }
+            }
+            if (document.getElementById("clean_kind").value == "hour") {
+                var hn = document.getElementById("clean_n").value;
+                if (!/^\d+$/.test(hn) || +hn < 1 || +hn > 23) { alert("Cleaner schedule: every how many hours? Use a whole number between 1 and 23"); document.getElementById("clean_n").focus(); return false; }
             }
         }
         document.getElementById("cmcommand").value = "/usr/local/emhttp/plugins/playback-cache/scripts/cache_crons.sh";
@@ -469,16 +477,16 @@ rsync copy command:
 <div class="title"><span class="left"><i class="fa fa-hand-peace-o title"></i>Schedule</span></div>
 
 Copy Schedule:
-: <select id="copy_kind" style="width:auto;" onchange="showKind('copy')"><option value="none">Not scheduled</option><option value="min">Every</option><option value="custom">Custom cron</option></select> <input type="number" id="copy_n" data-kind="copy" data-for="min" min="1" max="59" value="10" style="width:60px;"> <span data-kind="copy" data-for="min">&nbsp;minutes</span> <input type="text" id="copy_c" data-kind="copy" data-for="custom" maxlength="31" style="width:260px;" placeholder="minute hour day month weekday" > <input type="hidden" name="copy_cron" id="copy_cron" value="<?=htmlspecialchars($pcsettings_copy_cron, ENT_QUOTES);?>" > <span id="cron_copy_status" style="float:right;"><?=$cron_copy;?></span>
+: <select id="copy_kind" style="width:auto;" onchange="showKind('copy')"><option value="none">Not scheduled</option><option value="min">Every</option></select> <input type="number" id="copy_n" data-kind="copy" data-for="min" min="1" max="59" value="10" style="width:60px;"> <span data-kind="copy" data-for="min">&nbsp;minutes</span> <input type="hidden" name="copy_cron" id="copy_cron" value="<?=htmlspecialchars($pcsettings_copy_cron, ENT_QUOTES);?>" > <span id="cron_copy_status" style="float:right;"><?=$cron_copy;?></span>
 <blockquote class='inline_help'>
         <p>How often the plugin looks for playing media. APPLY ALL installs it into the crontab and saves it to the plugin folder, so it survives a reboot. "Not scheduled" removes it.</p>
 </blockquote>
 
 Cleaner Schedule:
-: <select id="clean_kind" style="width:auto;" onchange="showKind('clean')"><option value="none">Not scheduled</option><option value="day">Daily at</option><option value="week">Weekly on</option><option value="custom">Custom cron</option></select> <span data-kind="clean" data-for="week"><select id="clean_d" style="width:auto;"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></select>&nbsp;at</span> <input type="time" id="clean_t" data-kind="clean" data-for="day week" style="width:auto;"> <input type="text" id="clean_c" data-kind="clean" data-for="custom" maxlength="31" style="width:260px;" placeholder="minute hour day month weekday" > <input type="hidden" name="clean_cron" id="clean_cron" value="<?=htmlspecialchars($pcsettings_clean_cron, ENT_QUOTES);?>" > <span id="cron_clean_status" style="float:right;"><?=$cron_clean;?></span>
+: <select id="clean_kind" style="width:auto;" onchange="showKind('clean')"><option value="none">Not scheduled</option><option value="hour">Every</option><option value="day">Daily at</option><option value="week">Weekly on</option></select> <input type="number" id="clean_n" data-kind="clean" data-for="hour" min="1" max="23" value="12" style="width:60px;"> <span data-kind="clean" data-for="hour">&nbsp;hours</span> <span data-kind="clean" data-for="week"><select id="clean_d" style="width:auto;"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></select>&nbsp;at</span> <input type="time" id="clean_t" data-kind="clean" data-for="day week" style="width:auto;"> <input type="hidden" name="clean_cron" id="clean_cron" value="<?=htmlspecialchars($pcsettings_clean_cron, ENT_QUOTES);?>" > <span id="cron_clean_status" style="float:right;"><?=$cron_clean;?></span>
 <blockquote class='inline_help'>
         <p>When aged cache copies are removed. Daily at a quiet hour is the normal choice.</p>
-        <p>APPLY ALL installs it into the crontab and saves it to the plugin folder, so it survives a reboot. "Custom cron" takes the 5 usual fields: minute hour day month weekday.</p>
+        <p>APPLY ALL installs it into the crontab and saves it to the plugin folder, so it survives a reboot. "Not scheduled" removes it.</p>
 </blockquote>
 
 <div style="text-align: center; margin-top:12px;">

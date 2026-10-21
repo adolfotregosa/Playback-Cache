@@ -35,15 +35,17 @@ $list_rows = pc_list_details("/boot/config/plugins/playback-cache/playback-cache
         while (b >= 1024 && i < u.length - 1) { b = b / 1024; i++; }
         return (i == 0 ? b : b.toFixed(1)) + " " + u[i];
     }
-    function pcAge(h) {
-        if (h === null) { return "no stamp"; }
-        if (h < 1) { return "just now"; }
+    function pcLeft(m) {
+        if (m < 60) { return m + " min"; }
+        var h = Math.floor(m / 60);
         if (h < 48) { return h + " h"; }
         return Math.floor(h/24) + " d " + (h % 24) + " h";
     }
-    function pcRelease(h) {
-        if (h === null) { return "-"; }
-        return h > 0 ? "in " + pcAge(h) : "at next clean";
+    function pcRelease(f) {
+        // time until the clean run that actually releases the folder, a due folder waits for the next one
+        if (!f.cleaner) { return "no cleaner schedule"; }
+        if (typeof f.release != "number") { return "-"; }
+        return f.due ? "until next clean, " + pcLeft(f.release) : pcLeft(f.release);
     }
     var pcListLast = "";
     function pcListRender(folders) {
@@ -63,9 +65,8 @@ $list_rows = pc_list_details("/boot/config/plugins/playback-cache/playback-cache
             td1.appendChild(box);
             var td2 = document.createElement("td"); td2.style.padding = "2px 8px"; td2.textContent = f.path;
             var td3 = document.createElement("td"); td3.style.padding = "2px 8px"; td3.style.whiteSpace = "nowrap"; td3.textContent = pcSize(f.size);
-            var td4 = document.createElement("td"); td4.style.padding = "2px 8px"; td4.style.whiteSpace = "nowrap"; td4.textContent = pcAge(typeof f.age == "number" ? f.age : null);
-            var td5 = document.createElement("td"); td5.style.padding = "2px 8px"; td5.style.whiteSpace = "nowrap"; td5.textContent = pcRelease(typeof f.release == "number" ? f.release : null);
-            tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3); tr.appendChild(td4); tr.appendChild(td5);
+            var td4 = document.createElement("td"); td4.style.padding = "2px 8px"; td4.style.whiteSpace = "nowrap"; td4.textContent = pcRelease(f);
+            tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3); tr.appendChild(td4);
             rows.appendChild(tr);
         }
         document.getElementById("pc_list_count").textContent = folders.length;
@@ -103,11 +104,12 @@ $list_rows = pc_list_details("/boot/config/plugins/playback-cache/playback-cache
 <input type="hidden" id="listcommand" name="#command" value="/usr/local/emhttp/plugins/playback-cache/scripts/cache_list_delete.sh" />
 
 <p>Folders currently cached: <span id="pc_list_count"><?=count($list_rows);?></span>, file <code><?=htmlspecialchars($pcsettings_exclusion_list);?></code>.</p>
-<p>Releases the folder: files with an identical copy on the array are removed from the cache, everything else stays for the mover. "Removed in" counts from the last time the folder was played or cached. A folder is released at the first cleaner run after that time.</p>
+<p>RELEASE drops the cache copy of the selected folders: files that the plugin copied are removed from the cache, everything else stays for the mover. The original on the array is never touched.</p>
+<p>"Stays cached for" is the time until the cleaner run that drops the cache copy, the keep time plus the wait for the next scheduled clean.</p>
 
 <div style='border: 1px solid red; height:auto; max-height:60vh; overflow:auto;'>
 <table>
-<tr><td style="padding:2px 8px;"><input type="checkbox" id="pc_select_all" onClick="toggleAllList(this)"></td><td style="padding:2px 8px;"><b>Select all</b></td><td style="padding:2px 8px;"><b>Size</b></td><td style="padding:2px 8px;"><b>Idle for</b></td><td style="padding:2px 8px;"><b>Removed in</b></td></tr>
+<tr><td style="padding:2px 8px;"><input type="checkbox" id="pc_select_all" onClick="toggleAllList(this)"></td><td style="padding:2px 8px;"><b>Select all</b></td><td style="padding:2px 8px;"><b>Size</b></td><td style="padding:2px 8px;"><b>Stays cached for</b></td></tr>
 <tbody id="pc_list_rows">
 </tbody>
 </table>
