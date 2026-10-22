@@ -106,16 +106,6 @@ echo ""
 </INLINE>
 </FILE>
 
-<!-- one-time rename of the settings keys, an existing setup keeps working after the upgrade -->
-<FILE Run="/bin/bash">
-<INLINE>
-if [ -f &plgdir;/&name;.cfg ] &amp;&amp; grep -q "^move_excl_list=" &plgdir;/&name;.cfg; then
-	sed -i -e 's/^pool=/cache_pool=/' -e 's/^subfolders=/media_folders=/' -e 's/^wait_todo=/wait_minutes=/' -e 's/^move_excl_list=/exclusion_list=/' -e 's/^rsync_mode=/copy_scope=/' -e 's/^rsync_copy=/rsync_command=/' -e 's/^time_keephours_sub=/keep_hours_long=/' -e 's/^time_keephours=/keep_hours=/' -e 's/^subfolder_keep_sub=/keep_long_folders=/' -e 's/^unraid_note=/notifications=/' -e 's/^unraid_syslog=/log_to_syslog=/' -e 's/^script_cron_state=/copy_cron_state=/' -e 's/^script_cron=/copy_cron=/' -e 's/^rewrite_source=/path_mappings=/' -e 's/^exclusions=/never_cache=/' &plgdir;/&name;.cfg
-	echo "settings keys renamed to the new names"
-fi
-</INLINE>
-</FILE>
-
 <!-- a fresh install starts from the shipped defaults, an existing setup is never touched -->
 <FILE Run="/bin/bash">
 <INLINE>
