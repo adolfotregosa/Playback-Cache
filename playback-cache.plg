@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "playback-cache">
 <!ENTITY author    "Adolfo Rodrigues">
-<!ENTITY version   "2026.10.21">
+<!ENTITY version   "2026.11.05">
 <!ENTITY launch    "Utilities/playback-cache">
 <!ENTITY plgdir    "/boot/config/plugins/&name;">
 <!ENTITY pkg       "&name;-&version;-x86_64-1.txz">
@@ -40,6 +40,8 @@
 - Minor cosmetic fix on the cached tab.
 ###2026.10.21
 - Custom cron boxes removed from the schedules, the cleaner gains an every N hours option.
+###2026.11.05
+- The cached tab counts down the keep time left, every play starts it again.
 </CHANGES>
 
 <!-- python3 and gdb are requirements of the handle switching (gdb links against

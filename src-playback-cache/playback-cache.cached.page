@@ -42,10 +42,12 @@ $list_rows = pc_list_details("/boot/config/plugins/playback-cache/playback-cache
         return Math.floor(h/24) + " d " + (h % 24) + " h";
     }
     function pcRelease(f) {
-        // time until the clean run that actually releases the folder, a due folder waits for the next one
-        if (!f.cleaner) { return "no cleaner schedule"; }
-        if (typeof f.release != "number") { return "-"; }
-        return f.due ? "until next clean, " + pcLeft(f.release) : pcLeft(f.release);
+        // the keep time left, counted from the last play, a due folder waits for the next clean run
+        if (f.due === false && typeof f.left == "number") { return pcLeft(f.left); }
+        if (f.due !== true) { return "-"; }
+        if (!f.cleaner) { return "due, no cleaner schedule"; }
+        if (typeof f.release != "number") { return "due"; }
+        return "until next clean, " + pcLeft(f.release);
     }
     var pcListLast = "";
     function pcListRender(folders) {
@@ -105,7 +107,7 @@ $list_rows = pc_list_details("/boot/config/plugins/playback-cache/playback-cache
 
 <p>Folders currently cached: <span id="pc_list_count"><?=count($list_rows);?></span>, file <code><?=htmlspecialchars($pcsettings_exclusion_list);?></code>.</p>
 <p>RELEASE drops the cache copy of the selected folders: files that the plugin copied are removed from the cache, everything else stays for the mover. The original on the array is never touched.</p>
-<p>"Stays cached for" is the time until the cleaner run that drops the cache copy, the keep time plus the wait for the next scheduled clean.</p>
+<p>"Stays cached for" is the keep time left, counted from the last time the folder was played; every play starts it again. When it runs out, the next cleaner run drops the cache copy.</p>
 
 <div style='border: 1px solid red; height:auto; max-height:60vh; overflow:auto;'>
 <table>

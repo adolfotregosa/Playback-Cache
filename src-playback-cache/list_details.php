@@ -117,17 +117,19 @@ function pc_list_details($cfgfile) {
 		$hours = ($keep_regex != "" && preg_match($keep_regex, $list_line)) ? $keep_sub : $keep;
 		// the cleaner releases once the whole hours since the stamp are more than the keep
 		// hours, and only when it runs: the first clean run at or after that moment
-		$due = null; $release = null;
+		// left: minutes until the keep time runs out, counted from the last play, every play resets it
+		$due = null; $release = null; $left = null;
 		if (!is_null($stamp)) {
 			$due_ts = $stamp + ($hours + 1) * 3600;
 			$due = ($due_ts <= $now);
+			if (!$due) { $left = (int)ceil(($due_ts - $now) / 60); }
 			if ($clean_cron != "") {
 				$run = pc_cron_next($clean_cron, max($due_ts, $now));
 				if (!is_null($run)) { $release = (int)ceil(($run - $now) / 60); }
 			}
 		}
 		$out[] = array("path" => $list_line, "size" => (int)$cache_new[$list_line]["size"],
-			"due" => $due, "release" => $release, "cleaner" => ($clean_cron != ""));
+			"due" => $due, "left" => $left, "release" => $release, "cleaner" => ($clean_cron != ""));
 	}
 	// best effort, /var/run is tmpfs, a failed write only costs the cache
 	if (is_dir(dirname($cache_file))) { @file_put_contents($cache_file, json_encode($cache_new), LOCK_EX); }
